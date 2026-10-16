@@ -32,3 +32,24 @@ func killProcessGroup(cmd *exec.Cmd) error {
 	}
 	return nil
 }
+
+// processGroupID is the child's process group (its PID, via Setpgid).
+func processGroupID(cmd *exec.Cmd) int {
+	if cmd == nil || cmd.Process == nil {
+		return 0
+	}
+	return cmd.Process.Pid
+}
+
+// killGroup SIGKILLs process group pgid; a gone group is not an error.
+func killGroup(pgid int) {
+	if pgid > 0 {
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+	}
+}
+
+// processGroupAlive reports whether process group pgid still has members.
+func processGroupAlive(pgid int) bool {
+	err := syscall.Kill(-pgid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}

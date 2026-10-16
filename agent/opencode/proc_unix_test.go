@@ -4,7 +4,6 @@ package opencode
 
 import (
 	"context"
-	"errors"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -66,33 +65,81 @@ func TestOpencodeCloseKillsProcessGroup(t *testing.T) {
 	}
 }
 
-// A descendant that left the process group keeps stdout open: Close reports
-// the timeout (so the engine never resumes into it), closes the pipes, and
-// the read loop still exits.
-func TestOpencodeCloseTimeoutClosesPipes(t *testing.T) {
+// (a) A descendant that left the process group and redirected stderr keeps
+// stdout open: Close closes the session's read ends, so the read loop and
+// the stderr reader exit and Close returns within its bound.
+func TestOpencodeCloseUnblocksEscapedStdoutHolder(t *testing.T) {
 	if _, err := exec.LookPath("perl"); err != nil {
 		t.Skip("perl not available")
 	}
-	old := closeWaitTimeout
-	closeWaitTimeout = 200 * time.Millisecond
-	t.Cleanup(func() { closeWaitTimeout = old })
-
-	// perl leaves the group first, then signals readiness with its PID.
-	s, pid := startFakeTurn(t, `perl -e '$|=1; setpgrp(0,0); print "{\"type\":\"text\",\"part\":{\"text\":\"$$\"}}\n"; sleep 30' &`+"\nsleep 30")
+	s, pid := startFakeTurn(t, `perl -e '$|=1; setpgrp(0,0); open(STDERR, ">/dev/null"); print "{\"type\":\"text\",\"part\":{\"text\":\"$$\"}}\n"; sleep 30' &`+"\nsleep 30")
 	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
-	if err := s.Close(); err == nil {
-		t.Fatal("Close returned nil although the read loop was still running")
+	start := time.Now()
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if d := time.Since(start); d > closeWaitTimeout {
+		t.Errorf("Close took %v", d)
 	}
 	exited := make(chan struct{})
 	go func() { s.wg.Wait(); close(exited) }()
 	select {
 	case <-exited:
-	case <-time.After(pipeWaitDelay + 2*time.Second):
-		// exec closes the pipes cmd.WaitDelay after the cancel, so the read
-		// loop exits although the stray descendant keeps them open.
-		t.Fatal("read loop goroutine did not exit after the pipes were closed")
+	case <-time.After(time.Second):
+		t.Fatal("reader goroutines still running after Close")
 	}
-	if errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
-		t.Log("escaped descendant already gone")
+}
+
+// (b) The CLI already exited 0, leaving a same-group descendant that holds
+// no pipe: Close still kills the group.
+func TestOpencodeCloseKillsLeftoverGroupAfterExit(t *testing.T) {
+	script := `sleep 30 </dev/null >/dev/null 2>&1 &` + "\n" +
+		`echo "{\"type\":\"text\",\"part\":{\"text\":\"$!\"}}"` + "\nexit 0"
+	s, pid := startFakeTurn(t, script)
+	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+	// Wait for the turn to finish (the CLI exited, the read loop is done).
+	deadline := time.After(5 * time.Second)
+	for done := false; !done; {
+		select {
+		case evt := <-s.Events():
+			done = evt.Type == core.EventResult
+		case <-deadline:
+			t.Fatal("turn did not finish")
+		}
+	}
+	if !alive(pid) {
+		t.Fatal("precondition: descendant already gone")
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	waitGone := time.Now().Add(2 * time.Second)
+	for alive(pid) && time.Now().Before(waitGone) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if alive(pid) {
+		t.Fatal("descendant of an exited CLI survived Close")
+	}
+}
+
+// Item 2: the CLI exits 0 and a descendant keeps stderr open silently:
+// main's empty result, not an error.
+func TestOpencodeCleanExitWithHeldStderrIsResult(t *testing.T) {
+	script := `sleep 30 </dev/null >/dev/null &` + "\nexit 0"
+	s, err := newOpencodeSession(context.Background(), writeFakeOpencode(t, script), nil, t.TempDir(), "", "default", "", "", nil)
+	if err != nil {
+		t.Fatalf("newOpencodeSession: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.Send("hi", "m1", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	select {
+	case evt := <-s.Events():
+		if evt.Type != core.EventResult {
+			t.Fatalf("event = %v (%v), want EventResult", evt.Type, evt.Error)
+		}
+	case <-time.After(pipeWaitDelay + 5*time.Second):
+		t.Fatal("no event")
 	}
 }

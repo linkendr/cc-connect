@@ -39,11 +39,75 @@ type opencodeSession struct {
 	alive             atomic.Bool
 	expectingContinue atomic.Bool // true when compaction_continue received, waiting for next step
 	resultSent        atomic.Bool // true when EventResult has been sent for this turn
+
+	// Process lifecycle owned by the session (not by the exec context
+	// watcher, which stops watching once the CLI exits): procs are turns
+	// whose output pipes are still open; groups are process groups of this
+	// session's turns that may still have members. Close kills every group
+	// and closes every pipe read end, so no descendant or goroutine
+	// outlives the session.
+	procMu sync.Mutex
+	procs  map[*opencodeProc]struct{}
+	groups map[int]struct{}
 }
 
-// pipeWaitDelay bounds how long cmd.Wait waits for output pipes held open by
-// descendants after the child exited or was killed.
+// opencodeProc is one `opencode run` turn: its process group and the read
+// ends of its stdout/stderr pipes, which the session owns.
+type opencodeProc struct {
+	cmd     *exec.Cmd
+	pgid    int // 0 = no own process group (Windows)
+	stdoutR *os.File
+	stderrR *os.File
+}
+
+// pipeWaitDelay bounds how long a turn waits for stderr to reach EOF after
+// the CLI exited (a descendant may hold it open), and cmd.WaitDelay for the
+// stdin copy.
 const pipeWaitDelay = 2 * time.Second
+
+// lockedBuffer is a bytes.Buffer safe for one writer and concurrent readers.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func (s *opencodeSession) addProc(p *opencodeProc) {
+	s.procMu.Lock()
+	defer s.procMu.Unlock()
+	if s.procs == nil {
+		s.procs = make(map[*opencodeProc]struct{})
+		s.groups = make(map[int]struct{})
+	}
+	s.procs[p] = struct{}{}
+	if p.pgid > 0 {
+		s.groups[p.pgid] = struct{}{}
+	}
+}
+
+// finishProc drops a finished turn. Its process group stays recorded only
+// while it still has members (POSIX does not reuse a process group ID
+// during the group's lifetime), so Close can kill descendants the CLI left
+// behind without ever signalling an unrelated, reused group.
+func (s *opencodeSession) finishProc(p *opencodeProc) {
+	s.procMu.Lock()
+	defer s.procMu.Unlock()
+	delete(s.procs, p)
+	if p.pgid > 0 && !processGroupAlive(p.pgid) {
+		delete(s.groups, p.pgid)
+	}
+}
 
 func newOpencodeSession(ctx context.Context, cmd string, extraArgs []string, workDir, model, mode, agentName, resumeID string, extraEnv []string) (*opencodeSession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
@@ -94,11 +158,7 @@ func (s *opencodeSession) Send(prompt string, messageID string, images []core.Im
 
 	cmd := exec.CommandContext(s.ctx, s.cmd, args...)
 	prepareProcessGroup(cmd)
-	// If a descendant outside the group still holds stdout/stderr open
-	// after the turn is cancelled (or the child exits), exec closes our ends
-	// of the pipes after this delay, so the read loop's scanner and Wait
-	// unblock and the goroutine exits.
-	cmd.WaitDelay = pipeWaitDelay
+	cmd.WaitDelay = pipeWaitDelay // stdin copy only; stdout/stderr are our own pipes
 	cmd.Dir = s.workDir
 	env := os.Environ()
 	if len(s.extraEnv) > 0 {
@@ -106,21 +166,45 @@ func (s *opencodeSession) Send(prompt string, messageID string, images []core.Im
 	}
 	cmd.Env = env
 
-	stdout, err := cmd.StdoutPipe()
+	// The session owns both ends of the output pipes (instead of exec's
+	// StdoutPipe / Stderr copy), so Close can always close the read ends
+	// and unblock the readers, whatever a descendant does with its copies.
+	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
 		return fmt.Errorf("opencodeSession: stdout pipe: %w", err)
 	}
-
-	var stderrBuf bytes.Buffer
-	cmd.Stderr = &stderrBuf
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
+		return fmt.Errorf("opencodeSession: stderr pipe: %w", err)
+	}
+	cmd.Stdout = stdoutW
+	cmd.Stderr = stderrW
 	cmd.Stdin = strings.NewReader(prompt)
 
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("opencodeSession: start: %w", err)
+	startErr := cmd.Start()
+	// The child has its own copies now; ours must close so EOF can arrive.
+	_ = stdoutW.Close()
+	_ = stderrW.Close()
+	if startErr != nil {
+		_ = stdoutR.Close()
+		_ = stderrR.Close()
+		return fmt.Errorf("opencodeSession: start: %w", startErr)
 	}
 
-	s.wg.Add(1)
-	go s.readLoop(cmd, stdout, &stderrBuf)
+	proc := &opencodeProc{cmd: cmd, pgid: processGroupID(cmd), stdoutR: stdoutR, stderrR: stderrR}
+	s.addProc(proc)
+	stderrBuf := &lockedBuffer{}
+	stderrDone := make(chan struct{})
+	s.wg.Add(2)
+	go func() {
+		defer s.wg.Done()
+		defer close(stderrDone)
+		_, _ = io.Copy(stderrBuf, stderrR)
+		_ = stderrR.Close()
+	}()
+	go s.readLoop(cmd, proc, stderrBuf, stderrDone)
 
 	return nil
 }
@@ -201,8 +285,11 @@ func (s *opencodeSession) buildRunArgs(prompt string, imagePaths []string, chatI
 	return args
 }
 
-func (s *opencodeSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf *bytes.Buffer) {
+func (s *opencodeSession) readLoop(cmd *exec.Cmd, proc *opencodeProc, stderrBuf *lockedBuffer, stderrDone <-chan struct{}) {
 	defer s.wg.Done()
+	defer s.finishProc(proc)
+	defer func() { _ = proc.stdoutR.Close() }()
+	stdout := proc.stdoutR
 	waited := false
 	var waitErr error
 	wait := func() error {
@@ -245,11 +332,21 @@ func (s *opencodeSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBu
 		return
 	}
 
-	// stdout is at EOF: collect the exit status (this also finishes the
-	// stderr copy, so stderrBuf is complete below).
+	// stdout is at EOF: collect the exit status, then give stderr a bounded
+	// time to reach EOF (a descendant may keep it open; normal completion
+	// closes it with the CLI's exit).
 	exitErr := wait()
+	select {
+	case <-stderrDone:
+	case <-time.After(pipeWaitDelay):
+	case <-s.ctx.Done():
+	}
 	stderrMsg := stderrBuf.String()
-	if stderrMsg == "" && exitErr != nil && !sawStdout && s.ctx.Err() == nil {
+	// Non-zero exit is decided from the exit code, not from Wait's error:
+	// a clean exit (code 0) stays main's empty-result path even if Wait
+	// reported something else.
+	nonZeroExit := cmd.ProcessState != nil && cmd.ProcessState.ExitCode() != 0
+	if stderrMsg == "" && nonZeroExit && !sawStdout && s.ctx.Err() == nil {
 		// The process failed without a word (crash, kill, bad flag that
 		// prints nothing): report an error instead of synthesizing an empty
 		// successful result. Unclassified = provider-side for the agent
@@ -605,22 +702,50 @@ func (s *opencodeSession) Alive() bool {
 func (s *opencodeSession) Close() error {
 	s.alive.Store(false)
 	s.cancel()
+	// Do not rely on the exec context watcher (it stops once the CLI has
+	// exited): kill every process group of this session's turns, including
+	// descendants a finished CLI left behind, and close our read ends so the
+	// readers return even if a stray process still holds the write ends.
+	s.procMu.Lock()
+	groups := make([]int, 0, len(s.groups))
+	for g := range s.groups {
+		groups = append(groups, g)
+	}
+	procs := make([]*opencodeProc, 0, len(s.procs))
+	for p := range s.procs {
+		procs = append(procs, p)
+	}
+	s.procMu.Unlock()
+	for _, g := range groups {
+		killGroup(g)
+	}
+	for _, p := range procs {
+		if p.pgid == 0 && p.cmd.Process != nil {
+			_ = p.cmd.Process.Kill()
+		}
+		_ = p.stdoutR.Close()
+		_ = p.stderrR.Close()
+	}
 	done := make(chan struct{})
 	go func() {
 		s.wg.Wait()
 		close(done)
+	}()
+	// Second pass: a child forked while the first SIGKILL was delivered
+	// can miss it; its group ID is still reserved while it lives.
+	defer func() {
+		for _, g := range groups {
+			killGroup(g)
+		}
 	}()
 	select {
 	case <-done:
 		close(s.events)
 	case <-time.After(closeWaitTimeout):
 		slog.Warn("opencodeSession: close timed out, abandoning wg.Wait")
-		// The process group is already killed (cancel); a stray
-		// descendant outside it may still hold the pipes, which exec closes
-		// after cmd.WaitDelay so the read loop still exits.
-		// Report it: the read loop (and possibly a child holding the
-		// output pipe) is still running, so the engine must not resume this
-		// conversation into a new process (it marks the key unsafe).
+		// Report it: a reader is still running, so the engine must not
+		// resume this conversation into a new process (it marks the key
+		// unsafe).
 		return fmt.Errorf("opencode: read loop did not exit within %s", closeWaitTimeout)
 	}
 	return nil
