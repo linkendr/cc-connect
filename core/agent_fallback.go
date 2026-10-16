@@ -171,7 +171,8 @@ type agentFallbackChain struct {
 	handedOff map[string]fallbackWatermark
 	// owned maps each fallback state key to its conversation key and the
 	// state object currently registered under it (nil until bound).
-	owned map[string]fallbackRegistration
+	owned    map[string]fallbackRegistration
+	claimSeq uint64
 	// handoffs counts, per conversation key, the fallback hand-offs in
 	// progress (from the primary's failure until the chain is done).
 	handoffs map[string]int
@@ -227,27 +228,41 @@ func fallbackStateKey(interactiveKey string, i int) string {
 // through this registry, never by the shape of the key: platforms such as
 // cloud-web accept arbitrary external session keys, which may contain
 // "#fallback:".
-func (c *agentFallbackChain) registerState(fbKey, interactiveKey string) {
+//
+// registerState claims the key for the calling turn and returns the claim
+// token. The claim survives the cleanup of an older state under the same
+// key (forgetLocked keeps a claimed registration), so the turn that waits
+// for that teardown in getOrCreateInteractiveStateWith still owns the key
+// when it binds its new state.
+func (c *agentFallbackChain) registerState(fbKey, interactiveKey string) uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.claimSeq++
+	reg := c.owned[fbKey]
+	reg.owner = interactiveKey
+	reg.claim = c.claimSeq
+	c.owned[fbKey] = reg
+	return c.claimSeq
+}
+
+// bindState binds st to the turn's claim on fbKey, recreating the
+// registration if it was removed meanwhile, and releases the claim.
+func (c *agentFallbackChain) bindState(fbKey, interactiveKey string, st *interactiveState, claim uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	reg := c.owned[fbKey]
 	reg.owner = interactiveKey
-	c.owned[fbKey] = reg
-}
-
-// bindState records the state object now registered under fbKey.
-func (c *agentFallbackChain) bindState(fbKey string, st *interactiveState) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if reg, ok := c.owned[fbKey]; ok {
-		reg.state = st
-		c.owned[fbKey] = reg
+	reg.state = st
+	if reg.claim == claim {
+		reg.claim = 0
 	}
+	c.owned[fbKey] = reg
 }
 
 type fallbackRegistration struct {
 	owner string
 	state *interactiveState
+	claim uint64 // non-zero while a turn is creating/binding its state
 }
 
 // beginHandoff / endHandoff bracket a fallback hand-off for a conversation.
@@ -267,6 +282,12 @@ func (c *agentFallbackChain) endHandoff(interactiveKey string) {
 		return
 	}
 	c.handoffs[interactiveKey]--
+}
+
+func (c *agentFallbackChain) clearHandoffs() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.handoffs = make(map[string]int)
 }
 
 func (c *agentFallbackChain) inHandoff(interactiveKey string) bool {
@@ -289,6 +310,12 @@ func (c *agentFallbackChain) forgetLocked(key string, st *interactiveState) bool
 	reg, ok := c.owned[key]
 	if !ok || reg.state != st {
 		return false
+	}
+	if reg.claim != 0 {
+		// A newer turn already claimed the key: keep its registration.
+		reg.state = nil
+		c.owned[key] = reg
+		return true
 	}
 	delete(c.owned, key)
 	return true
@@ -620,9 +647,9 @@ func (e *Engine) runFallbackTurn(guard fallbackGuard, i int, agent Agent, fbSess
 		return turnOutcome{Failed: true}
 	}
 	defer fbSession.Unlock(fbGen)
-	chain.registerState(fbKey, interactiveKey)
+	claim := chain.registerState(fbKey, interactiveKey)
 	state := e.getOrCreateInteractiveStateWith(fbKey, in.platform, in.replyCtx, fbSession, fbSessions, agent, ccKey)
-	chain.bindState(fbKey, state)
+	chain.bindState(fbKey, interactiveKey, state, claim)
 	// Re-check now that the state is registered: a /stop that ran before
 	// registration could not see it (stopFallbackStates found nothing), but
 	// it marked the primary stopped / bumped the lock generation first.

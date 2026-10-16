@@ -2460,6 +2460,29 @@ func (e *Engine) Stop() error {
 	}
 	e.interactiveMu.Unlock()
 
+	if e.agentFallback != nil {
+		// Agent fallback chain: a turn (primary or fallback) waiting for a
+		// permission answer must not outlive shutdown; deny it so the wait
+		// returns, and drop hand-off markers.
+		for key, state := range states {
+			state.mu.Lock()
+			pending := state.pending
+			state.pending = nil
+			as := state.agentSession
+			state.mu.Unlock()
+			if pending == nil {
+				continue
+			}
+			if as != nil {
+				if err := as.RespondPermission(pending.RequestID, PermissionResult{Behavior: "deny", Message: "cc-connect is shutting down"}); err != nil {
+					slog.Debug("engine.Stop: deny pending permission", "session", key, "error", err)
+				}
+			}
+			pending.resolve()
+		}
+		e.agentFallback.clearHandoffs()
+	}
+
 	for key, state := range states {
 		if state.agentSession != nil {
 			slog.Debug("engine.Stop: closing agent session", "session", key)
@@ -5416,6 +5439,14 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	// interceptTurn ends the turn without showing the failure and reports
 	// it to the caller (agent fallback chain).
 	interceptTurn := func(kind ErrorKind, resetAt time.Time, errText string) turnOutcome {
+		// First, before any platform call or wait below can block: from
+		// here until the chain is done the conversation counts as live for
+		// the stale-lock self-heal (answerWithFallbacks ends the hand-off).
+		handoff := false
+		if intercept == interceptRetriable && e.agentFallback != nil {
+			e.agentFallback.beginHandoff(sessionKey)
+			handoff = true
+		}
 		cp.Finalize(ProgressCardStateFailed)
 		sp.discard()
 		if pendingSend != nil {
@@ -5429,13 +5460,6 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		state.mu.Unlock()
 		slog.Warn("agent turn failed; handing it to the fallback chain",
 			"session_key", sessionKey, "kind", kind, "reset_at", resetAt, "error", errText)
-		handoff := false
-		if intercept == interceptRetriable && e.agentFallback != nil {
-			// From here until the chain is done the conversation counts as
-			// live for the stale-lock self-heal (answerWithFallbacks ends it).
-			e.agentFallback.beginHandoff(sessionKey)
-			handoff = true
-		}
 		return turnOutcome{Intercepted: true, Kind: kind, ResetAt: resetAt, ErrText: errText, Input: in, handoffBegun: handoff}
 	}
 
@@ -6999,8 +7023,13 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 			if until, kind, blocked := e.agentFallback.primaryBlocked(); blocked {
 				session.AddHistory("user", queued.content)
 				sessions.Save()
+				// Like a normal turn: no idle close of the primary while
+				// this turn runs (its close would stop the fallback too);
+				// re-armed when the turn is done.
+				e.cancelAgentSessionIdleClose(state)
 				guard := fallbackGuard{primary: state, session: session, sessions: sessions, lockGen: lockGen, interactiveKey: sessionKey}
 				e.answerWithFallbacks(guard, turnOutcome{Intercepted: true, Kind: kind, ResetAt: until, blocked: true, Input: queued})
+				e.rearmPrimaryIdleClose(state, sessionKey)
 				continue
 			}
 		}
@@ -7098,6 +7127,17 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		if fallbackDrain {
 			e.restartUnsolicitedReaderAfterQueuedTurn(state, session, sessions, sessionKey)
 		}
+	}
+}
+
+// rearmPrimaryIdleClose re-arms the primary's idle close after a queued
+// fallback-only turn, under the same conditions as the end of a turn.
+func (e *Engine) rearmPrimaryIdleClose(state *interactiveState, sessionKey string) {
+	state.mu.Lock()
+	alive := state.agentSession != nil && state.agentSession.Alive() && !state.stopped && !state.eventsNeedResync
+	state.mu.Unlock()
+	if alive {
+		e.scheduleAgentSessionIdleClose(sessionKey, state)
 	}
 }
 
@@ -11021,7 +11061,15 @@ func (e *Engine) stopInteractiveSessionWithOptions(sessionKey string, notifyQueu
 	for attempt := 0; ; attempt++ {
 		target, release := e.acquireDispatchForStop(sessionKey)
 		if target == nil {
-			return false
+			// No primary state (e.g. its idle close removed it): still stop
+			// fallback agents answering for this conversation.
+			stopped := false
+			for _, key := range e.agentFallback.ownedStatesOf(sessionKey) {
+				if e.stopInteractiveSessionWithOptions(key, notifyQueued) {
+					stopped = true
+				}
+			}
+			return stopped
 		}
 		expect := target
 		if attempt >= maxStopRetargets {

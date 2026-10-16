@@ -53,6 +53,7 @@ type scriptedSession struct {
 
 	// Optional test hooks.
 	beforeTurn func(n int)        // runs before turn n is emitted (inside Send, unlocked)
+	afterTurn  func(n int)        // runs after turn n was emitted (inside Send, unlocked)
 	dieAfter   map[int]bool       // mark dead after emitting turn n
 	closeAfter map[int]bool       // close the event channel after emitting turn n
 	onAllow    scriptedTurn       // emitted when a permission is allowed
@@ -89,6 +90,12 @@ func (s *scriptedSession) Send(prompt string, messageID string, images []ImageAt
 		s.closed = true
 		_ = s.queuingAgentSession.Close()
 	}
+	after := s.afterTurn
+	s.mu.Unlock()
+	if after != nil {
+		after(n)
+	}
+	s.mu.Lock() // re-taken for the deferred Unlock
 	return nil
 }
 
@@ -1192,7 +1199,7 @@ func TestAgentFallback_HookKeysUseRegistryNotSubstring(t *testing.T) {
 	chained := newFallbackEnv(t, nil, []scriptedTurn{okTurn("x")})
 	chained.e.SetHooks(newHM())
 	chained.e.hooks.Emit(HookEvent{Event: HookEventSessionStarted, SessionKey: external})
-	chained.e.agentFallback.registerState(fallbackStateKey("chat", 0), "chat")
+	chained.e.agentFallback.bindState(fallbackStateKey("chat", 0), "chat", nil, chained.e.agentFallback.registerState(fallbackStateKey("chat", 0), "chat"))
 	chained.e.hooks.Emit(HookEvent{Event: HookEventMessageSent, SessionKey: fallbackStateKey("chat", 0)})
 	chained.e.hooks.Emit(HookEvent{Event: HookEventSessionEnded, SessionKey: fallbackStateKey("chat", 0)})
 
@@ -1652,8 +1659,7 @@ func TestAgentFallback_CleanupKeepsReplacementRegistration(t *testing.T) {
 	env.e.interactiveStates[fallbackTestKey] = primary
 	env.e.interactiveStates[fbKey] = a
 	env.e.interactiveMu.Unlock()
-	chain.registerState(fbKey, fallbackTestKey)
-	chain.bindState(fbKey, a)
+	chain.bindState(fbKey, fallbackTestKey, a, chain.registerState(fbKey, fallbackTestKey))
 
 	var once sync.Once
 	testHookAfterStateRemoved = func(key string) {
@@ -1661,11 +1667,11 @@ func TestAgentFallback_CleanupKeepsReplacementRegistration(t *testing.T) {
 			return
 		}
 		once.Do(func() { // a new turn registers B under the same key
-			chain.registerState(fbKey, fallbackTestKey)
+			claim := chain.registerState(fbKey, fallbackTestKey)
 			env.e.interactiveMu.Lock()
 			env.e.interactiveStates[fbKey] = b
 			env.e.interactiveMu.Unlock()
-			chain.bindState(fbKey, b)
+			chain.bindState(fbKey, fallbackTestKey, b, claim)
 		})
 	}
 	t.Cleanup(func() { testHookAfterStateRemoved = nil })
@@ -1722,5 +1728,189 @@ func TestErrorKindIsTerminal(t *testing.T) {
 		if k.IsTerminal() {
 			t.Errorf("%q must not be terminal", k)
 		}
+	}
+}
+
+// ---------- review round 5 ----------
+
+// R5-1: the next turn claims the fallback key before it waits for the old
+// state A to be torn down; A's cleanup then removes A but not the claim,
+// and the new state B is bound to it: B is registered and /stop stops it.
+func TestAgentFallback_ClaimSurvivesOldStateCleanup(t *testing.T) {
+	env := newFallbackEnv(t, nil, []scriptedTurn{okTurn("unused")})
+	session := env.e.sessions.GetOrCreateActive(fallbackTestKey)
+	primary := &interactiveState{agentSession: newScriptedSession("p"), busySession: session, platform: env.p, replyCtx: "ctx"}
+	fbKey := fallbackStateKey(fallbackTestKey, 0)
+	a := &interactiveState{agentSession: newScriptedSession("fa"), busySession: NewSessionManager("").GetOrCreateActive("x"), platform: env.p, replyCtx: "ctx"}
+	b := &interactiveState{agentSession: newScriptedSession("fb"), busySession: NewSessionManager("").GetOrCreateActive("y"), platform: env.p, replyCtx: "ctx"}
+	chain := env.e.agentFallback
+	env.e.interactiveMu.Lock()
+	env.e.interactiveStates[fallbackTestKey] = primary
+	env.e.interactiveStates[fbKey] = a
+	env.e.interactiveMu.Unlock()
+	chain.bindState(fbKey, fallbackTestKey, a, chain.registerState(fbKey, fallbackTestKey))
+
+	// The next turn claims the key (runFallbackTurn), then waits for A.
+	claim := chain.registerState(fbKey, fallbackTestKey)
+	var once sync.Once
+	testHookAfterStateRemoved = func(key string) {
+		if key != fbKey {
+			return
+		}
+		once.Do(func() {
+			// Between A's removal and B's creation the claim must hold.
+			if keys := chain.ownedStatesOf(fallbackTestKey); len(keys) != 1 {
+				t.Errorf("claimed key not registered after A's removal: %v", keys)
+			}
+			env.e.interactiveMu.Lock()
+			env.e.interactiveStates[fbKey] = b
+			env.e.interactiveMu.Unlock()
+			chain.bindState(fbKey, fallbackTestKey, b, claim)
+		})
+	}
+	t.Cleanup(func() { testHookAfterStateRemoved = nil })
+
+	env.e.cleanupInteractiveState(fbKey, a)
+	chain.mu.Lock()
+	reg, ok := chain.owned[fbKey]
+	chain.mu.Unlock()
+	if !ok || reg.state != b || reg.claim != 0 {
+		t.Fatalf("registration = %+v (ok=%v), want bound to B with no open claim", reg, ok)
+	}
+	env.e.stopInteractiveSession(fallbackTestKey, env.p, "ctx")
+	if !b.isStopped() {
+		t.Error("/stop did not stop B")
+	}
+}
+
+// R5-2a: during a reset window, the primary's idle close is armed (its
+// last turn ended cleanly with an empty queue) when a message is queued and
+// takes the blocked-primary shortcut. The shortcut must disarm the close
+// while the fallback answers, or the close tears the conversation and the
+// running fallback down.
+func TestAgentFallback_QueuedBlockedTurnDisarmsPrimaryIdleClose(t *testing.T) {
+	env := newFallbackEnv(t, nil, []scriptedTurn{okTurn("fb answer")})
+	env.e.SetAgentSessionIdleTimeout(30 * time.Millisecond)
+	env.e.agentFallback.recordPrimaryFailure(ErrorKindUsageLimit, env.now.Add(time.Hour))
+	primary := newScriptedSession("primary-sid")
+	env.primary.session = primary
+	st, session, gen := env.drainFixture(primary, true)
+	// Arm the idle close as the end of the previous turn did, before the
+	// message was queued (scheduling refuses while the queue is non-empty).
+	st.mu.Lock()
+	queued := st.pendingMessages
+	st.pendingMessages = nil
+	st.mu.Unlock()
+	env.e.scheduleAgentSessionIdleClose(fallbackTestKey, st)
+	st.mu.Lock()
+	armed := st.agentSessionIdleCancel != nil
+	st.pendingMessages = queued
+	st.mu.Unlock()
+	if !armed {
+		t.Fatal("precondition: idle close not armed")
+	}
+	entered, release := gate(env.fbs[0].session, 0)
+
+	drained := make(chan struct{})
+	go func() {
+		env.e.drainPendingMessages(st, session, env.e.sessions, fallbackTestKey, gen)
+		close(drained)
+	}()
+	waitClosed(t, entered, "queued fallback turn")
+	time.Sleep(150 * time.Millisecond) // an armed 30 ms close would fire now
+	close(release)
+	env.waitSent("fb answer")
+	waitClosed(t, drained, "drain")
+	if env.primaryState() != st {
+		t.Error("primary state was closed by its idle timer during the fallback turn")
+	}
+}
+
+// R5-2b: /stop stops a running fallback even when the primary state is
+// already gone (e.g. removed by its idle close).
+func TestAgentFallback_StopWithoutPrimaryStopsFallback(t *testing.T) {
+	env := newFallbackEnv(t,
+		[]scriptedTurn{usageLimitTurn(time.Time{})},
+		[]scriptedTurn{okTurn("fallback answer")},
+	)
+	entered, release := gate(env.fbs[0].session, 0)
+	env.receive("question")
+	waitClosed(t, entered, "fallback turn")
+	env.e.interactiveMu.Lock()
+	fbState := env.e.interactiveStates[fallbackStateKey(fallbackTestKey, 0)]
+	delete(env.e.interactiveStates, fallbackTestKey) // primary gone
+	env.e.interactiveMu.Unlock()
+
+	if !env.e.stopInteractiveSession(fallbackTestKey, env.p, "ctx") {
+		t.Error("/stop reported nothing to stop while a fallback was running")
+	}
+	if fbState == nil || !fbState.isStopped() {
+		t.Error("fallback state not stopped")
+	}
+	close(release)
+}
+
+// R5-3: the hand-off is recorded before any blocking work of the
+// interception (here: the primary's Send still returning). A second message
+// with an expired stale-lock threshold is rejected, and the original turn
+// gets its fallback answer.
+func TestAgentFallback_HandoffRecordedBeforeBlockingWork(t *testing.T) {
+	env := newFallbackEnv(t,
+		[]scriptedTurn{errorTurn(`API Error: {"error":{"type":"rate_limit_error"}}`, ErrorKindRateLimit)},
+		[]scriptedTurn{okTurn("fallback answer")},
+	)
+	env.e.SetStaleLockBreakAfter(time.Nanosecond)
+	primary := env.primary.session
+	primary.dieAfter = map[int]bool{0: true}
+	inSend, releaseSend := make(chan struct{}), make(chan struct{})
+	primary.afterTurn = func(int) {
+		close(inSend)
+		<-releaseSend // Send has emitted the error but not returned yet
+	}
+
+	env.receive("first")
+	waitClosed(t, inSend, "primary Send")
+	// Give the event loop time to reach the interception, which then waits
+	// for the blocked Send.
+	deadline := time.Now().Add(time.Second)
+	for !env.e.agentFallback.inHandoff(fallbackTestKey) && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	env.receive("second")
+	if got := env.sentContaining("Previous request still processing"); got != 1 {
+		t.Errorf("second message not rejected; sent = %#v", env.p.getSent())
+	}
+	if env.sentContaining("会话卡锁已自动恢复") != 0 {
+		t.Error("stale-lock recovery broke the lock before the hand-off was recorded")
+	}
+	close(releaseSend)
+	env.waitSent("fallback answer")
+	env.waitIdle()
+}
+
+// R5-5: engine Stop answers a fallback's pending permission (deny) so the
+// waiting turn returns.
+func TestAgentFallback_StopResolvesPendingPermission(t *testing.T) {
+	env := newFallbackEnv(t,
+		[]scriptedTurn{usageLimitTurn(time.Time{})},
+		[]scriptedTurn{{{Type: EventPermissionRequest, RequestID: "p1", ToolName: "Bash", ToolInput: "rm -rf x"}}},
+	)
+	env.receive("question")
+	fbKey := fallbackStateKey(fallbackTestKey, 0)
+	waitTrue(t, "fallback permission request", func() bool {
+		_, pending := env.e.lookupPending(fbKey)
+		return pending != nil
+	})
+	resolved := watchLog(t, "permission resolved")
+	if err := env.e.Stop(); err != nil {
+		t.Logf("Stop: %v", err)
+	}
+	waitClosed(t, resolved, "pending permission to resolve on Stop")
+	perms := env.fbs[0].session.permissions()
+	if len(perms) != 1 || perms[0].Behavior != "deny" {
+		t.Errorf("permission answers = %+v, want one deny", perms)
+	}
+	if env.e.agentFallback.inHandoff(fallbackTestKey) {
+		t.Error("hand-off survived engine Stop")
 	}
 }
