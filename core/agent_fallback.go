@@ -403,6 +403,10 @@ var stopDispatchWait = 2 * time.Second
 // resolved the state to stop and before it takes that state's gate.
 var testHookStopAfterCapture func()
 
+// testHookBeforePermissionPublish, when set by a test, runs in the event
+// loop right before a permission request is published to state.pending.
+var testHookBeforePermissionPublish func()
+
 // testHookAfterStateRemoved, when set by a test, runs right after
 // cleanupInteractiveState removed a state from interactiveStates.
 var testHookAfterStateRemoved func(key string)
@@ -716,7 +720,16 @@ func (e *Engine) runFallbackTurn(guard fallbackGuard, i int, agent Agent, fbSess
 	state.fallbackIntercept = interceptNone
 	alive := state.agentSession != nil && state.agentSession.Alive() && !state.stopped
 	state.mu.Unlock()
-	if alive {
+	if out.Intercepted || out.Failed {
+		// Retire a fallback session whose turn ended in an error: its
+		// process may still emit events (e.g. a late completion after the
+		// error) that the next turn would take as its own. Close it (kills
+		// the process, waits for its read loop) and remove the state, while
+		// this turn still holds the fallback busy lock; the next turn starts
+		// a fresh agent session. Only fallback states are retired; the
+		// primary's session reuse is unchanged.
+		e.cleanupInteractiveState(fbKey, state)
+	} else if alive {
 		e.scheduleAgentSessionIdleClose(fbKey, state)
 	}
 

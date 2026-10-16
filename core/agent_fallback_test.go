@@ -1914,3 +1914,80 @@ func TestAgentFallback_StopResolvesPendingPermission(t *testing.T) {
 		t.Error("hand-off survived engine Stop")
 	}
 }
+
+// ---------- review round 6 ----------
+
+// R6-1: a fallback session whose turn ended in an error is retired: the
+// next message gets a fresh agent session, so a late completion from the
+// old process (emitted when the next turn sends) can never be taken as
+// the next turn's answer.
+func TestAgentFallback_FailedFallbackSessionIsRetired(t *testing.T) {
+	env := newFallbackEnv(t,
+		[]scriptedTurn{usageLimitTurn(time.Time{}), usageLimitTurn(time.Time{})},
+		[]scriptedTurn{
+			errorTurn("openai: 500 internal error", ErrorKindUnknown),
+			{{Type: EventResult, Content: "", Done: true}}, // A's stale completion
+		},
+		[]scriptedTurn{okTurn("A answered by fallback 1")},
+	)
+	stale := env.fbs[0].session
+	env.fbs[0].more = []*scriptedSession{newScriptedSession("fb0-fresh", okTurn("B answer"))}
+
+	env.send("A")
+	env.waitSent("A answered by fallback 1")
+	env.send("B")
+	env.waitSent("B answer")
+	if got := env.sentContaining("(empty response)"); got != 0 {
+		t.Errorf("B took A's stale completion; sent = %#v", env.p.getSent())
+	}
+	if got := env.fbs[0].StartCount(); got != 2 {
+		t.Errorf("fallback 0 started %d sessions, want 2 (retired after the error)", got)
+	}
+	if got := len(stale.prompts()); got != 1 {
+		t.Errorf("failed fallback session reused: %d prompts", got)
+	}
+}
+
+// R6-2: a permission request published after Stop took its snapshot still
+// ends: the wait also watches engine shutdown and denies the request.
+func TestAgentFallback_PermissionPublishedAfterStopIsDenied(t *testing.T) {
+	env := newFallbackEnv(t,
+		[]scriptedTurn{usageLimitTurn(time.Time{})},
+		[]scriptedTurn{{{Type: EventPermissionRequest, RequestID: "p1", ToolName: "Bash", ToolInput: "ls"}}},
+	)
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	testHookBeforePermissionPublish = func() {
+		once.Do(func() {
+			close(entered)
+			<-release
+		})
+	}
+	t.Cleanup(func() { testHookBeforePermissionPublish = nil })
+
+	env.receive("question")
+	waitClosed(t, entered, "permission about to be published")
+	resolved := watchLog(t, "permission resolved")
+	_ = env.e.Stop()
+	close(release)
+	waitClosed(t, resolved, "permission wait to end after Stop")
+	perms := env.fbs[0].session.permissions()
+	if len(perms) != 1 || perms[0].Behavior != "deny" {
+		t.Errorf("permission answers = %+v, want one deny", perms)
+	}
+}
+
+// R6-3: OpenCode's silent-crash error (unclassified EventError) advances the
+// chain to the next fallback.
+func TestAgentFallback_SilentCrashErrorAdvances(t *testing.T) {
+	env := newFallbackEnv(t,
+		[]scriptedTurn{usageLimitTurn(time.Time{})},
+		[]scriptedTurn{errorTurn("opencode exited without output: exit status 1", ErrorKindUnknown)},
+		[]scriptedTurn{okTurn("second fallback answer")},
+	)
+	env.send("question")
+	env.waitSent("second fallback answer")
+	if env.sentContaining("exited without output") != 0 {
+		t.Errorf("crash shown instead of advancing: %#v", env.p.getSent())
+	}
+}

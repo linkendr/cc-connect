@@ -5502,6 +5502,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				p := state.platform
 				state.mu.Unlock()
 				e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
+				outcome.Failed = true
 				return
 			}
 			continue
@@ -6094,6 +6095,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				Questions:    event.Questions,
 				Resolved:     make(chan struct{}),
 			}
+			if e.agentFallback != nil && testHookBeforePermissionPublish != nil {
+				testHookBeforePermissionPublish()
+			}
 			state.mu.Lock()
 			state.pending = pending
 			state.mu.Unlock()
@@ -6117,7 +6121,30 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				idleTimer.Stop()
 			}
 
-			<-pending.Resolved
+			if e.agentFallback != nil {
+				// Agent fallback chain: engine shutdown also ends the wait,
+				// including a request published after Stop took its
+				// snapshot of pending permissions (deny it).
+				select {
+				case <-pending.Resolved:
+				case <-e.ctx.Done():
+					// Answer only if nobody else took the request (Stop's
+					// snapshot or a user reply clear state.pending first).
+					state.mu.Lock()
+					owned := state.pending == pending
+					if owned {
+						state.pending = nil
+					}
+					as := state.agentSession
+					state.mu.Unlock()
+					if owned && as != nil {
+						_ = as.RespondPermission(pending.RequestID, PermissionResult{Behavior: "deny", Message: "cc-connect is shutting down"})
+					}
+					pending.resolve()
+				}
+			} else {
+				<-pending.Resolved
+			}
 			slog.Info("permission resolved", "request_id", event.RequestID)
 
 			// The stream preview was frozen+detached when this permission
@@ -6815,6 +6842,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			if state.agentSession == nil || !state.agentSession.Alive() {
 				e.notifyDroppedQueuedMessages(state, event.Error)
 			}
+			outcome.Failed = true
 			return
 		}
 	}
