@@ -231,7 +231,7 @@ func (s *opencodeSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBu
 			s.chatID.Store("")
 			slog.Warn("opencodeSession: cleared stale session ID")
 		}
-		evt := core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrMsg)}
+		evt := core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrMsg), ErrorKind: classifyOpencodeText(stderrMsg)}
 		select {
 		case s.events <- evt:
 		case <-s.ctx.Done():
@@ -442,7 +442,21 @@ func classifyOpencodeError(raw map[string]any, msg string) core.ErrorKind {
 	case "ContextOverflowError", "ContextWindowExceededError":
 		return core.ErrorKindContextTooLong
 	}
-	low := strings.ToLower(msg)
+	return classifyOpencodeText(msg)
+}
+
+// classifyOpencodeText classifies free error text (the formatted JSON
+// error, or stderr of a failed `opencode run`): an aborted message and a
+// context overflow are terminal; everything else, including auth and quota
+// errors, stays unclassified (provider-side).
+func classifyOpencodeText(text string) core.ErrorKind {
+	if strings.Contains(text, "MessageAbortedError") {
+		return core.ErrorKindCancelled
+	}
+	if strings.Contains(text, "ContextOverflowError") || strings.Contains(text, "ContextWindowExceededError") {
+		return core.ErrorKindContextTooLong
+	}
+	low := strings.ToLower(text)
 	for _, p := range []string{"context_length_exceeded", "maximum context length", "context window", "prompt is too long"} {
 		if strings.Contains(low, p) {
 			return core.ErrorKindContextTooLong

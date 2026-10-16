@@ -884,6 +884,10 @@ type = "claudecode"
 #   session, so the primary's --resume is untouched.
 #   fallback agent 会收到 cc-connect 会话最近 6 轮对话作为上下文；各 agent 会话独立。
 # - Not supported with mode = "multi-workspace". / 不支持 multi-workspace 模式。
+# - OpenCode sends no permission requests (cc-connect cannot answer them), so
+#   with mode = "default" only Claude Code's prompts reach the chat; an
+#   OpenCode fallback runs in its own mode ("yolo" skips its prompts).
+#   OpenCode 不发送权限请求，mode="default" 时只有 Claude Code 的确认会转到聊天中。
 #
 # fallback = [
 #   { type = "opencode", model = "openai/gpt-6-sol" },

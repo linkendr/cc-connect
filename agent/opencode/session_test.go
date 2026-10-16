@@ -358,3 +358,24 @@ func TestClassifyOpencodeError(t *testing.T) {
 		})
 	}
 }
+
+func TestClassifyOpencodeText_Stderr(t *testing.T) {
+	cases := []struct {
+		name   string
+		stderr string
+		want   core.ErrorKind
+	}{
+		{"context overflow", "Error: ContextOverflowError: input exceeds the model's context window", core.ErrorKindContextTooLong},
+		{"context length text", `APIError: {"error":{"code":"context_length_exceeded"}}`, core.ErrorKindContextTooLong},
+		{"aborted", "MessageAbortedError: The operation was aborted", core.ErrorKindCancelled},
+		{"auth is provider-side", "ProviderAuthError: missing API key for openai", core.ErrorKindUnknown},
+		{"crash is provider-side", "panic: something", core.ErrorKindUnknown},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyOpencodeText(tc.stderr); got != tc.want {
+				t.Errorf("classifyOpencodeText(%q) = %q, want %q", tc.stderr, got, tc.want)
+			}
+		})
+	}
+}

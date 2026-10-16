@@ -65,6 +65,14 @@ func classifyResultError(raw map[string]any, assistantErr string, rejectedResetA
 		return core.ErrorKindUnknown, time.Time{}
 	}
 	if nonRetriableResultSubtypes[subtype] {
+		// Terminal for an agent fallback chain: another agent would hit the
+		// same caller-side limit.
+		switch subtype {
+		case "error_max_turns":
+			return core.ErrorKindMaxTurns, time.Time{}
+		case "error_max_budget_usd":
+			return core.ErrorKindMaxBudget, time.Time{}
+		}
 		return core.ErrorKindUnknown, time.Time{}
 	}
 

@@ -112,14 +112,14 @@ func TestHandleResult_ErrorKind(t *testing.T) {
 			wantKind: core.ErrorKindUsageLimit,
 		},
 		{
-			name:     "error_max_turns is not retriable even with a limit word",
+			name:     "error_max_turns is terminal, not retriable, even with a limit word",
 			result:   map[string]any{"type": "result", "subtype": "error_max_turns", "is_error": true, "errors": []any{"Reached max turns; usage limit resets never"}},
-			wantKind: core.ErrorKindUnknown,
+			wantKind: core.ErrorKindMaxTurns,
 		},
 		{
-			name:     "error_max_budget_usd is not retriable",
+			name:     "error_max_budget_usd is terminal, not retriable",
 			result:   map[string]any{"type": "result", "subtype": "error_max_budget_usd", "is_error": true},
-			wantKind: core.ErrorKindUnknown,
+			wantKind: core.ErrorKindMaxBudget,
 		},
 		{
 			name:     "auth error is not retriable",
