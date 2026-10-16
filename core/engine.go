@@ -4021,10 +4021,20 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	var blockedCause turnOutcome
 	skipPrimary := false
 	if fallbackChain != nil {
+		// The primary's fallback policy belongs to the state, not to this
+		// turn: messages queued behind a fallback-only turn must still be
+		// eligible (blocked check, interception) when they are drained.
+		state.mu.Lock()
+		state.fallbackIntercept = interceptRetriable
+		state.turnInput = queuedMessageFromMessage(p, msg)
+		state.mu.Unlock()
 		if until, kind, blocked := fallbackChain.primaryBlocked(); blocked {
 			skipPrimary = true
 			blockedCause = turnOutcome{Intercepted: true, Kind: kind, ResetAt: until, blocked: true, Input: queuedMessageFromMessage(p, msg)}
 		}
+	}
+	fallbackGuardFor := func() fallbackGuard {
+		return fallbackGuard{primary: state, session: session, sessions: sessions, lockGen: lockGen, interactiveKey: interactiveKey, ccSessionKey: ccSessionKey}
 	}
 
 	if state.agentSession == nil && !skipPrimary {
@@ -4089,7 +4099,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 			stopTyping()
 			stopTyping = nil
 		}
-		e.answerWithFallbacks(session, sessions, interactiveKey, ccSessionKey, blockedCause)
+		e.answerWithFallbacks(fallbackGuardFor(), blockedCause)
 	} else {
 		promptContent := e.buildSenderPrompt(msg.Content, msg.UserID, msg.UserName, msg.Platform, msg.SessionKey, msg.ChannelKey)
 
@@ -4098,10 +4108,6 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 		state.currentMessageID = msg.MessageID
 		state.fromVoice = msg.FromVoice
 		state.sideText = ""
-		if fallbackChain != nil {
-			state.fallbackIntercept = interceptRetriable
-			state.turnInput = queuedMessageFromMessage(p, msg)
-		}
 		as := state.agentSession // capture under lock to avoid race with cleanup
 		state.mu.Unlock()
 
@@ -4123,7 +4129,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 		}
 		stopTyping = nil // ownership transferred; prevent defer from double-stopping
 		if outcome.Intercepted {
-			e.answerWithFallbacks(session, sessions, interactiveKey, ccSessionKey, outcome)
+			e.answerWithFallbacks(fallbackGuardFor(), outcome)
 		}
 	}
 
@@ -5370,6 +5376,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		select {
 		case <-stopCh:
 			sp.discard()
+			outcome.Cancelled = true
 			return
 		case event, ok = <-events:
 			if !ok {
@@ -6723,6 +6730,20 @@ channelClosed:
 		e.cleanupInteractiveState(sessionKey, state)
 		return interceptTurn(ErrorKindUnknown, time.Time{}, "agent process exited")
 	}
+	if isFallbackState && len(textParts) == 0 && !state.isStopped() {
+		// The last fallback agent exited without an answer or an error
+		// event: say so, or the user sees only the fallback notice.
+		cp.Finalize(ProgressCardStateFailed)
+		sp.discard()
+		state.mu.Lock()
+		state.eventsNeedResync = true
+		p := state.platform
+		state.mu.Unlock()
+		e.cleanupInteractiveState(sessionKey, state)
+		e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "fallback agent exited without an answer"))
+		outcome.Failed = true
+		return
+	}
 	state.mu.Lock()
 	state.eventsNeedResync = true
 	state.mu.Unlock()
@@ -6894,7 +6915,8 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 			if until, kind, blocked := e.agentFallback.primaryBlocked(); blocked {
 				session.AddHistory("user", queued.content)
 				sessions.Save()
-				e.answerWithFallbacks(session, sessions, sessionKey, "", turnOutcome{Intercepted: true, Kind: kind, ResetAt: until, blocked: true, Input: queued})
+				guard := fallbackGuard{primary: state, session: session, sessions: sessions, lockGen: lockGen, interactiveKey: sessionKey}
+				e.answerWithFallbacks(guard, turnOutcome{Intercepted: true, Kind: kind, ResetAt: until, blocked: true, Input: queued})
 				continue
 			}
 		}
@@ -6904,12 +6926,35 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		state.mu.Lock()
 		as := state.agentSession // capture under lock to avoid race with cleanup (mirrors #1436)
 		state.mu.Unlock()
+		if (as == nil || !as.Alive()) && primaryWithFallback && e.agentFallback != nil {
+			// The primary died on a retriable failure (e.g. claude exited on
+			// a 429). Start it again for this queued message instead of
+			// dropping the queue; the new state adopts the remaining queue
+			// and keeps fallback eligibility.
+			restarted := e.getOrCreateInteractiveStateWith(sessionKey, queued.platform, queued.replyCtx, session, sessions, nil, "")
+			restarted.mu.Lock()
+			restarted.platform = queued.platform
+			restarted.replyCtx = queued.replyCtx
+			restarted.currentMessageID = queued.messageID
+			restarted.fromVoice = queued.fromVoice
+			restarted.currentTurnUserMessageTimeMs = queued.userMessageTimeMs
+			restarted.fallbackIntercept = interceptRetriable
+			restarted.turnInput = queued
+			as = restarted.agentSession
+			restarted.mu.Unlock()
+			state = restarted
+		}
 		if as == nil || !as.Alive() {
 			e.send(queued.platform, queued.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "agent session ended"))
 			e.notifyDroppedQueuedMessages(state, fmt.Errorf("agent session ended"))
 			return false
 		}
 
+		// This goroutine owns the event channel for the queued turn: stop
+		// the unsolicited reader first, or it can steal the turn's result or
+		// auto-deny its permission requests.
+		e.stopUnsolicitedReader(state)
+		e.cancelAgentSessionIdleClose(state)
 		drainEvents(as.Events())
 
 		session.AddHistory("user", queued.content)
@@ -6930,8 +6975,25 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 
 		slog.Info("processing queued message", "session", sessionKey)
 		if outcome := e.processInteractiveEvents(state, session, sessions, sessionKey, queued.messageID, time.Now(), stopTyping, sendDone, queued.replyCtx, lockGen); outcome.Intercepted {
-			e.answerWithFallbacks(session, sessions, sessionKey, "", outcome)
+			guard := fallbackGuard{primary: state, session: session, sessions: sessions, lockGen: lockGen, interactiveKey: sessionKey}
+			e.answerWithFallbacks(guard, outcome)
 		}
+		e.restartUnsolicitedReaderAfterQueuedTurn(state, session, sessions, sessionKey)
+	}
+}
+
+// restartUnsolicitedReaderAfterQueuedTurn hands the event channel back to
+// the unsolicited reader and re-arms the idle close after a queued turn,
+// mirroring the end of processInteractiveMessageWith. The next queued turn
+// stops the reader again before it sends.
+func (e *Engine) restartUnsolicitedReaderAfterQueuedTurn(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string) {
+	state.mu.Lock()
+	alive := state.agentSession != nil && state.agentSession.Alive() && !state.stopped && !state.eventsNeedResync
+	workspaceDir := state.workspaceDir
+	state.mu.Unlock()
+	if alive {
+		e.startUnsolicitedReader(state, session, sessions, sessionKey, workspaceDir)
+		e.scheduleAgentSessionIdleClose(sessionKey, state)
 	}
 }
 

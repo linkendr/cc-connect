@@ -2,8 +2,11 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -43,6 +46,14 @@ type scriptedSession struct {
 	turns  []scriptedTurn
 	sends  int
 	closed bool
+	dead   bool // Alive()=false without closing the channel (process exited)
+
+	// Optional test hooks.
+	beforeTurn func(n int)        // runs before turn n is emitted (inside Send, unlocked)
+	dieAfter   map[int]bool       // mark dead after emitting turn n
+	closeAfter map[int]bool       // close the event channel after emitting turn n
+	onAllow    scriptedTurn       // emitted when a permission is allowed
+	perms      []PermissionResult // RespondPermission calls
 }
 
 func newScriptedSession(id string, turns ...scriptedTurn) *scriptedSession {
@@ -52,17 +63,47 @@ func newScriptedSession(id string, turns ...scriptedTurn) *scriptedSession {
 func (s *scriptedSession) Send(prompt string, messageID string, images []ImageAttachment, files []FileAttachment) error {
 	_ = s.queuingAgentSession.Send(prompt, messageID, images, files)
 	s.mu.Lock()
+	n := s.sends
+	s.sends++
+	hook := s.beforeTurn
+	s.mu.Unlock()
+	if hook != nil {
+		hook(n)
+	}
+	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed || s.sends >= len(s.turns) {
-		s.sends++
+	if s.closed || n >= len(s.turns) {
 		return nil
 	}
-	turn := s.turns[s.sends]
-	s.sends++
-	for _, ev := range turn {
+	for _, ev := range s.turns[n] {
 		s.events <- ev // buffered (16); scripts are short
 	}
+	if s.dieAfter[n] {
+		s.dead = true
+	}
+	if s.closeAfter[n] {
+		s.closed = true
+		_ = s.queuingAgentSession.Close()
+	}
 	return nil
+}
+
+func (s *scriptedSession) RespondPermission(_ string, res PermissionResult) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.perms = append(s.perms, res)
+	if res.Behavior == "allow" && !s.closed {
+		for _, ev := range s.onAllow {
+			s.events <- ev
+		}
+	}
+	return nil
+}
+
+func (s *scriptedSession) permissions() []PermissionResult {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]PermissionResult(nil), s.perms...)
 }
 
 func (s *scriptedSession) Close() error {
@@ -80,7 +121,7 @@ func (s *scriptedSession) Close() error {
 func (s *scriptedSession) Alive() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return !s.closed
+	return !s.closed && !s.dead
 }
 
 func (s *scriptedSession) prompts() []string {
@@ -89,11 +130,13 @@ func (s *scriptedSession) prompts() []string {
 	return append([]string(nil), s.sendCalls...)
 }
 
-// scriptedAgent hands out one scripted session (reused for every turn).
+// scriptedAgent hands out its scripted session; after a restart it hands
+// out the next one from more (the last one is reused).
 type scriptedAgent struct {
 	name    string
 	display string
 	session *scriptedSession
+	more    []*scriptedSession
 	mu      sync.Mutex
 	starts  int
 }
@@ -104,7 +147,17 @@ func (a *scriptedAgent) StartSession(_ context.Context, _ string) (AgentSession,
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.starts++
+	if a.starts > 1 && len(a.more) > 0 {
+		a.session = a.more[0]
+		a.more = a.more[1:]
+	}
 	return a.session, nil
+}
+
+func (a *scriptedAgent) current() *scriptedSession {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.session
 }
 func (a *scriptedAgent) ListSessions(_ context.Context) ([]AgentSessionInfo, error) { return nil, nil }
 func (a *scriptedAgent) Stop() error                                                { return nil }
@@ -116,10 +169,33 @@ func (a *scriptedAgent) StartCount() int {
 
 // ---------- harness ----------
 
+// hookPlatform is a stub platform that can react synchronously to what the
+// engine sends (e.g. issue /stop right after the fallback notice).
+type hookPlatform struct {
+	stubPlatformEngine
+	hookMu sync.Mutex
+	onSend func(content string)
+}
+
+func (h *hookPlatform) Send(ctx context.Context, rc any, content string) error {
+	_ = h.stubPlatformEngine.Send(ctx, rc, content)
+	h.hookMu.Lock()
+	fn := h.onSend
+	h.hookMu.Unlock()
+	if fn != nil {
+		fn(content)
+	}
+	return nil
+}
+
+func (h *hookPlatform) Reply(ctx context.Context, rc any, content string) error {
+	return h.Send(ctx, rc, content)
+}
+
 type fallbackEnv struct {
 	t        *testing.T
 	e        *Engine
-	p        *stubPlatformEngine
+	p        *hookPlatform
 	primary  *scriptedAgent
 	fbs      []*scriptedAgent
 	built    []int // factory calls per fallback index
@@ -132,7 +208,7 @@ func newFallbackEnv(t *testing.T, primaryTurns []scriptedTurn, fallbackTurns ...
 	t.Helper()
 	env := &fallbackEnv{
 		t:       t,
-		p:       &stubPlatformEngine{n: "test"},
+		p:       &hookPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}},
 		primary: &scriptedAgent{name: "primary", display: "Claude Code", session: newScriptedSession("primary-sid", primaryTurns...)},
 		now:     time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC),
 	}
@@ -530,5 +606,304 @@ func TestAgentFallback_StopAlsoStopsFallbackTurn(t *testing.T) {
 	case <-env.fbs[0].session.controllableAgentSession.closed:
 	case <-time.After(3 * time.Second):
 		t.Error("fallback agent session was not closed by /stop")
+	}
+}
+
+// ---------- review fixes (GPT-6 Astra findings) ----------
+
+// receive delivers a message without waiting for its turn.
+func (env *fallbackEnv) receive(content string) {
+	env.msgCount++
+	env.e.ReceiveMessage(env.p, &Message{
+		SessionKey: fallbackTestKey,
+		Platform:   "test",
+		MessageID:  fmt.Sprintf("m%d", env.msgCount),
+		UserID:     "u1",
+		UserName:   "user",
+		Content:    content,
+		ReplyCtx:   "ctx",
+	})
+}
+
+// gate blocks a scripted session before turn n until release is closed;
+// entered is closed when the turn reaches the gate.
+func gate(s *scriptedSession, n int) (entered, release chan struct{}) {
+	entered, release = make(chan struct{}), make(chan struct{})
+	s.mu.Lock()
+	s.beforeTurn = func(i int) {
+		if i == n {
+			close(entered)
+			<-release
+		}
+	}
+	s.mu.Unlock()
+	return entered, release
+}
+
+func waitClosed(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
+
+// waitQueued waits until the primary state holds n queued messages.
+func (env *fallbackEnv) waitQueued(n int) {
+	env.t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		env.e.interactiveMu.Lock()
+		st := env.e.interactiveStates[fallbackTestKey]
+		env.e.interactiveMu.Unlock()
+		if st != nil {
+			st.mu.Lock()
+			q := len(st.pendingMessages)
+			st.mu.Unlock()
+			if q >= n {
+				return
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	env.t.Fatalf("message was not queued; sent = %#v", env.p.getSent())
+}
+
+// P1-1: a message queued during a fallback turn is drained on the primary
+// with exclusive ownership of its event channel: no unsolicited reader runs
+// while it is sent, its permission request reaches the user (not
+// auto-denied), and it gets its own result.
+func TestAgentFallback_QueuedTurnAfterFallbackOwnsEventChannel(t *testing.T) {
+	env := newFallbackEnv(t,
+		[]scriptedTurn{
+			usageLimitTurn(time.Time{}),
+			{{Type: EventPermissionRequest, RequestID: "r1", ToolName: "Bash", ToolInput: "ls", ToolInputRaw: map[string]any{"command": "ls"}}},
+		},
+		[]scriptedTurn{okTurn("fallback answer")},
+	)
+	primary := env.primary.session
+	primary.onAllow = okTurn("queued answer")
+	readerRunningAtSend := make(chan bool, 1)
+	primary.beforeTurn = func(n int) {
+		if n != 1 {
+			return
+		}
+		env.e.interactiveMu.Lock()
+		st := env.e.interactiveStates[fallbackTestKey]
+		env.e.interactiveMu.Unlock()
+		st.mu.Lock()
+		readerRunningAtSend <- st.unsolicitedCancel != nil
+		st.mu.Unlock()
+	}
+	entered, release := gate(env.fbs[0].session, 0)
+
+	env.receive("first")
+	waitClosed(t, entered, "fallback turn")
+	env.receive("second") // queued behind the fallback turn
+	env.waitQueued(1)
+	close(release)
+
+	select {
+	case running := <-readerRunningAtSend:
+		if running {
+			t.Fatal("unsolicited reader was running when the queued turn was sent")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("queued message never reached the primary")
+	}
+	// The permission request is the queued turn's own: the user answers it.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, pending := env.e.lookupPending(fallbackTestKey); pending != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("permission request never reached the foreground turn; perms = %+v", primary.permissions())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	env.receive("allow")
+	env.waitSent("queued answer")
+	env.waitIdle()
+	for _, p := range primary.permissions() {
+		if p.Behavior != "allow" {
+			t.Errorf("permission auto-answered %+v", p)
+		}
+	}
+}
+
+// P1-2: /stop between the fallback notice and the fallback send cancels the
+// turn: the fallback agent is never sent the message.
+func TestAgentFallback_StopAfterNoticeCancelsFallback(t *testing.T) {
+	env := newFallbackEnv(t,
+		[]scriptedTurn{usageLimitTurn(time.Time{})},
+		[]scriptedTurn{okTurn("must not run")},
+	)
+	var once sync.Once
+	stopped := make(chan struct{})
+	env.p.hookMu.Lock()
+	env.p.onSend = func(content string) {
+		if strings.Contains(content, "answering with") {
+			once.Do(func() {
+				env.e.stopInteractiveSession(fallbackTestKey, env.p, "ctx")
+				close(stopped)
+			})
+		}
+	}
+	env.p.hookMu.Unlock()
+	sent := make(chan struct{})
+	env.fbs[0].session.mu.Lock()
+	env.fbs[0].session.beforeTurn = func(int) { close(sent) }
+	env.fbs[0].session.mu.Unlock()
+
+	env.receive("question")
+	waitClosed(t, stopped, "/stop after notice")
+	// Negative check: give the turn goroutine time to (wrongly) send.
+	select {
+	case <-sent:
+		t.Fatal("fallback agent was sent the stopped message")
+	case <-time.After(300 * time.Millisecond):
+	}
+	env.e.interactiveMu.Lock()
+	_, registered := env.e.interactiveStates[fallbackStateKey(fallbackTestKey, 0)]
+	env.e.interactiveMu.Unlock()
+	if registered {
+		t.Error("fallback state left registered after a cancelled turn")
+	}
+}
+
+// P1-4: the last fallback exits without text or an error event: the user
+// gets an error, not just the notice.
+func TestAgentFallback_FinalFallbackSilentExitShowsError(t *testing.T) {
+	env := newFallbackEnv(t,
+		[]scriptedTurn{usageLimitTurn(time.Time{})},
+		[]scriptedTurn{{}},
+	)
+	env.fbs[0].session.closeAfter = map[int]bool{0: true}
+	env.send("question")
+	env.waitSent("fallback agent exited without an answer")
+}
+
+// P2-5: a fresh chat during a known block sends its first message straight
+// to the fallback; a message queued behind it must also skip the blocked
+// primary.
+func TestAgentFallback_FreshChatDuringBlockQueuedMessageSkipsPrimary(t *testing.T) {
+	env := newFallbackEnv(t,
+		[]scriptedTurn{okTurn("primary must not answer")},
+		[]scriptedTurn{okTurn("fb one"), okTurn("fb two")},
+	)
+	env.e.agentFallback.recordPrimaryFailure(ErrorKindUsageLimit, env.now.Add(time.Hour))
+	entered, release := gate(env.fbs[0].session, 0)
+
+	env.receive("first")
+	waitClosed(t, entered, "fallback turn")
+	env.receive("second")
+	env.waitQueued(1)
+	close(release)
+	env.waitSent("fb two")
+	env.waitIdle()
+	if got := len(env.primary.session.prompts()); got != 0 {
+		t.Errorf("blocked primary got %d prompts, want 0", got)
+	}
+}
+
+// P2-6: the primary dies on a retriable process-exit error with no reset
+// time while a message is queued; the queued message restarts the primary
+// instead of being dropped with "agent session ended".
+func TestAgentFallback_DeadPrimaryQueuedMessageRestartsPrimary(t *testing.T) {
+	env := newFallbackEnv(t,
+		[]scriptedTurn{errorTurn(`API Error: {"error":{"type":"rate_limit_error"}}`, ErrorKindRateLimit)},
+		[]scriptedTurn{okTurn("fallback answer")},
+	)
+	first := env.primary.session
+	first.dieAfter = map[int]bool{0: true}
+	second := newScriptedSession("primary-sid-2", okTurn("queued primary answer"))
+	env.primary.more = []*scriptedSession{second}
+	entered, release := gate(first, 0)
+
+	env.receive("first")
+	waitClosed(t, entered, "primary turn")
+	env.receive("second") // queued while the primary is still alive
+	env.waitQueued(1)
+	close(release)
+
+	env.waitSent("fallback answer")
+	env.waitSent("queued primary answer")
+	env.waitIdle()
+	if got := env.sentContaining("agent session ended"); got != 0 {
+		t.Errorf("queued message dropped: %#v", env.p.getSent())
+	}
+	if got := env.primary.StartCount(); got != 2 {
+		t.Errorf("primary started %d times, want 2 (restart for the queued message)", got)
+	}
+	if got := second.prompts(); len(got) != 1 || !strings.Contains(got[0], "second") {
+		t.Errorf("restarted primary prompts = %q", got)
+	}
+}
+
+// P2-7: hooks see the user's conversation key, never the internal
+// "#fallback:N" state key, and no session start/end for fallback states.
+func TestAgentFallback_HooksSeeConversationKey(t *testing.T) {
+	var mu sync.Mutex
+	var got []HookEvent
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var ev HookEvent
+		_ = json.NewDecoder(r.Body).Decode(&ev)
+		mu.Lock()
+		got = append(got, ev)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	env := newFallbackEnv(t,
+		[]scriptedTurn{usageLimitTurn(time.Time{})},
+		[]scriptedTurn{errorTurn("openai quota exceeded", ErrorKindUnknown)},
+		[]scriptedTurn{okTurn("fallback answer")},
+	)
+	async := false
+	env.e.SetHooks(NewHookManager("test", []HookConfig{{Event: "*", Type: "http", URL: srv.URL, Async: &async}}, "sh", "-c", ""))
+	env.send("question")
+	env.waitSent("fallback answer")
+	env.waitIdle()
+
+	mu.Lock()
+	defer mu.Unlock()
+	sawSent := false
+	for _, ev := range got {
+		if ev.SessionKey != fallbackTestKey {
+			t.Errorf("hook %s has session key %q, want %q", ev.Event, ev.SessionKey, fallbackTestKey)
+		}
+		if ev.Event == HookEventMessageSent && strings.Contains(ev.Content, "fallback answer") {
+			sawSent = true
+		}
+	}
+	if !sawSent {
+		t.Errorf("no message.sent hook for the fallback answer; got %+v", got)
+	}
+	starts := 0
+	for _, ev := range got {
+		if ev.Event == HookEventSessionStarted {
+			starts++
+		}
+	}
+	if starts != 1 {
+		t.Errorf("session.started hooks = %d, want 1 (primary only)", starts)
+	}
+}
+
+func TestExternalSessionKey(t *testing.T) {
+	cases := map[string]string{
+		"discord:chan:thread":                    "discord:chan:thread",
+		"discord:chan:thread#fallback:0":         "discord:chan:thread",
+		"tg:1:1#cron:abc#fallback:2":             "tg:1:1#cron:abc",
+		fallbackStateKey("ws:/repo:slack:C1", 1): "ws:/repo:slack:C1",
+		"":                                       "",
+	}
+	for in, want := range cases {
+		if got := externalSessionKey(in); got != want {
+			t.Errorf("externalSessionKey(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

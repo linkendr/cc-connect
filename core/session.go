@@ -80,6 +80,15 @@ func (s *Session) TryLock() (uint64, bool) {
 	return s.lockGen, true
 }
 
+// HoldsLock reports whether the busy lock is still held under generation
+// gen, i.e. no /stop (ForceUnlock) or stale-lock break has taken the turn
+// away from its holder since TryLock returned gen.
+func (s *Session) HoldsLock(gen uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.busy && s.lockGen == gen
+}
+
 // Busy reports whether the session is currently locked for an in-flight turn.
 // Used by commands (e.g. /ps) that only make sense while a task is running.
 func (s *Session) Busy() bool {

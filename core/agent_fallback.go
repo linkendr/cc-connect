@@ -97,9 +97,38 @@ type turnOutcome struct {
 	// Input is the message whose turn failed. It may be a queued message
 	// that the event loop picked up after the original one.
 	Input queuedMessage
+	// Cancelled is true when the turn was stopped (/stop, session reset,
+	// shutdown); nothing more must run for it.
+	Cancelled bool
+	// Failed is true when the turn ended with an error already shown.
+	Failed bool
 	// blocked marks a turn that skipped the primary because of an earlier
 	// reset time (ResetAt).
 	blocked bool
+}
+
+// fallbackGuard is the turn-scoped context of a fallback run: the primary
+// state and busy-lock generation that own the user's turn. /stop marks the
+// primary stopped and force-unlocks the session (bumping the generation), so
+// a fallback that has not started yet must check cancelled() before it is
+// created and before it is sent the message.
+type fallbackGuard struct {
+	primary        *interactiveState
+	session        *Session
+	sessions       *SessionManager
+	lockGen        uint64
+	interactiveKey string
+	ccSessionKey   string
+}
+
+func (g fallbackGuard) cancelled(e *Engine) bool {
+	if e.ctx.Err() != nil {
+		return true
+	}
+	if g.primary != nil && g.primary.isStopped() {
+		return true
+	}
+	return g.lockGen != 0 && !g.session.HoldsLock(g.lockGen)
 }
 
 func queuedMessageFromMessage(p Platform, msg *Message) queuedMessage {
@@ -179,6 +208,16 @@ func fallbackStateKey(interactiveKey string, i int) string {
 
 func isFallbackStateKey(key string) bool {
 	return strings.Contains(key, "#fallback:")
+}
+
+// externalSessionKey maps an internal fallback state key back to the user's
+// conversation key ("chat#fallback:0" → "chat"). Hooks and other external
+// consumers only ever see the conversation key.
+func externalSessionKey(key string) string {
+	if i := strings.Index(key, "#fallback:"); i >= 0 {
+		return key[:i]
+	}
+	return key
 }
 
 // agentAt returns fallback agent i and its session manager, building them on
@@ -303,7 +342,7 @@ func formatResetTime(t, now time.Time) string {
 
 // answerWithFallbacks answers cause.Input with the fallback chain after the
 // primary failed (or was skipped). session/sessions are the primary's.
-func (e *Engine) answerWithFallbacks(session *Session, sessions *SessionManager, interactiveKey, ccSessionKey string, cause turnOutcome) {
+func (e *Engine) answerWithFallbacks(guard fallbackGuard, cause turnOutcome) {
 	chain := e.agentFallback
 	in := cause.Input
 	if !cause.blocked {
@@ -312,7 +351,8 @@ func (e *Engine) answerWithFallbacks(session *Session, sessions *SessionManager,
 	failedLabel := agentDisplayName(e.agent)
 	last := len(chain.specs) - 1
 	for i := range chain.specs {
-		if e.ctx.Err() != nil {
+		if guard.cancelled(e) {
+			slog.Info("agent fallback: turn cancelled before fallback", "session_key", guard.interactiveKey, "index", i)
 			return
 		}
 		agent, fbSessions, err := chain.agentAt(i)
@@ -323,7 +363,7 @@ func (e *Engine) answerWithFallbacks(session *Session, sessions *SessionManager,
 		}
 		label := chain.label(i, agent)
 		slog.Warn("agent fallback: answering with fallback agent",
-			"session_key", interactiveKey, "index", i, "fallback", label,
+			"session_key", guard.interactiveKey, "index", i, "fallback", label,
 			"kind", cause.Kind, "blocked", cause.blocked, "reset_at", cause.ResetAt)
 		e.send(in.platform, in.replyCtx, e.fallbackNotice(failedLabel, cause, label))
 
@@ -331,8 +371,9 @@ func (e *Engine) answerWithFallbacks(session *Session, sessions *SessionManager,
 		if i == last {
 			mode = interceptNone
 		}
-		out := e.runFallbackTurn(i, agent, fbSessions, session, sessions, interactiveKey, ccSessionKey, in, mode)
+		out := e.runFallbackTurn(guard, i, agent, fbSessions, in, mode)
 		if !out.Intercepted {
+			// Answered, failed with the error shown, or cancelled.
 			return
 		}
 		cause = out
@@ -349,8 +390,10 @@ func (e *Engine) answerWithFallbacks(session *Session, sessions *SessionManager,
 }
 
 // runFallbackTurn runs one turn of in on fallback agent i.
-func (e *Engine) runFallbackTurn(i int, agent Agent, fbSessions *SessionManager, session *Session, sessions *SessionManager, interactiveKey, ccSessionKey string, in queuedMessage, mode fallbackIntercept) turnOutcome {
+func (e *Engine) runFallbackTurn(guard fallbackGuard, i int, agent Agent, fbSessions *SessionManager, in queuedMessage, mode fallbackIntercept) turnOutcome {
 	chain := e.agentFallback
+	session, sessions := guard.session, guard.sessions
+	interactiveKey, ccSessionKey := guard.interactiveKey, guard.ccSessionKey
 	fbKey := fallbackStateKey(interactiveKey, i)
 	// One fallback conversation per primary cc-connect session: /new on the
 	// primary gives the fallback agent a fresh conversation too.
@@ -360,7 +403,17 @@ func (e *Engine) runFallbackTurn(i int, agent Agent, fbSessions *SessionManager,
 	if ccKey == "" {
 		ccKey = interactiveKey
 	}
+	if guard.cancelled(e) {
+		return turnOutcome{Cancelled: true}
+	}
 	state := e.getOrCreateInteractiveStateWith(fbKey, in.platform, in.replyCtx, fbSession, fbSessions, agent, ccKey)
+	// Re-check now that the state is registered: a /stop that ran before
+	// registration could not see it (stopFallbackStates found nothing), but
+	// it marked the primary stopped / bumped the lock generation first.
+	if guard.cancelled(e) {
+		e.cleanupInteractiveState(fbKey, state)
+		return turnOutcome{Cancelled: true}
+	}
 	if state.agentSession == nil {
 		return turnOutcome{Intercepted: true, ErrText: e.i18n.T(MsgFailedToStartAgentSession), Input: in}
 	}
@@ -388,6 +441,10 @@ func (e *Engine) runFallbackTurn(i int, agent Agent, fbSessions *SessionManager,
 	fbSession.AddHistory("user", in.content)
 	histBefore := fbSession.HistoryLen()
 
+	if guard.cancelled(e) || state.isStopped() {
+		e.cleanupInteractiveState(fbKey, state)
+		return turnOutcome{Cancelled: true}
+	}
 	var stopTyping func()
 	if ti, ok := in.platform.(TypingIndicator); ok {
 		stopTyping = ti.StartTyping(e.ctx, in.replyCtx)

@@ -132,6 +132,15 @@ func (hm *HookManager) Emit(event HookEvent) {
 		return
 	}
 	event.Project = hm.project
+	// Agent fallback states run under internal keys ("chat#fallback:0");
+	// hooks see the user's conversation key. Their session start/end is an
+	// implementation detail of one turn, not a conversation lifecycle event.
+	if isFallbackStateKey(event.SessionKey) {
+		if event.Event == HookEventSessionStarted || event.Event == HookEventSessionEnded {
+			return
+		}
+		event.SessionKey = externalSessionKey(event.SessionKey)
+	}
 	if event.Timestamp.IsZero() {
 		event.Timestamp = time.Now()
 	}
