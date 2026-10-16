@@ -579,6 +579,106 @@ type AgentConfig struct {
 	Options      map[string]any   `toml:"options"`
 	ProviderRefs []string         `toml:"provider_refs,omitempty"` // references to global [[providers]] by name
 	Providers    []ProviderConfig `toml:"providers"`
+	// Fallback is an ordered chain of agents that answer a turn when this
+	// agent's turn fails with a rate-limit, overloaded, or usage-limit error.
+	// Each new message starts on this (primary) agent again. Empty = no
+	// fallback (default). At most MaxAgentFallbacks entries.
+	Fallback []FallbackAgentConfig `toml:"fallback,omitempty"`
+}
+
+// MaxAgentFallbacks caps [projects.agent].fallback.
+const MaxAgentFallbacks = 3
+
+// FallbackAgentConfig is one entry of [projects.agent].fallback.
+//
+//	[projects.agent]
+//	type = "claudecode"
+//	fallback = [
+//	  { type = "opencode", model = "openai/gpt-6-sol" },
+//	  { type = "opencode", model = "deepseek/deepseek-v4-pro" },
+//	]
+type FallbackAgentConfig struct {
+	Type string `toml:"type"`
+	// Model is a convenience for Options["model"], the model option every
+	// agent adapter reads. Setting both to different values is an error.
+	Model string `toml:"model,omitempty"`
+	// Label is the name shown in the "answering with …" notice. Default:
+	// the agent's display name plus the model, e.g. "OpenCode (openai/gpt-6-sol)".
+	Label   string         `toml:"label,omitempty"`
+	Options map[string]any `toml:"options,omitempty"`
+}
+
+// EffectiveOptions returns a copy of Options with Model mapped to "model".
+func (f FallbackAgentConfig) EffectiveOptions() map[string]any {
+	opts := make(map[string]any, len(f.Options)+1)
+	for k, v := range f.Options {
+		opts[k] = v
+	}
+	if m := strings.TrimSpace(f.Model); m != "" {
+		opts["model"] = m
+	}
+	return opts
+}
+
+// EffectiveModel returns the model this fallback entry will run.
+func (f FallbackAgentConfig) EffectiveModel() string {
+	if m := strings.TrimSpace(f.Model); m != "" {
+		return m
+	}
+	m, _ := f.Options["model"].(string)
+	return strings.TrimSpace(m)
+}
+
+// validateAgentFallback checks [projects.agent].fallback: known shape, at
+// most MaxAgentFallbacks entries, no entry that is the primary agent itself
+// or repeats an earlier entry (either would loop the chain back onto an agent
+// that just failed). Whether each type is compiled in is checked at startup
+// against the agent registry, which config cannot see.
+func validateAgentFallback(prefix string, proj ProjectConfig) error {
+	chain := proj.Agent.Fallback
+	if len(chain) == 0 {
+		return nil
+	}
+	if len(chain) > MaxAgentFallbacks {
+		return fmt.Errorf("config: %s.agent.fallback has %d entries, at most %d allowed", prefix, len(chain), MaxAgentFallbacks)
+	}
+	if proj.Mode == "multi-workspace" {
+		return fmt.Errorf("config: %s.agent.fallback is not supported with mode = \"multi-workspace\"", prefix)
+	}
+	type key struct{ typ, model string }
+	primaryModel, _ := proj.Agent.Options["model"].(string)
+	seen := map[key]int{{strings.TrimSpace(proj.Agent.Type), strings.TrimSpace(primaryModel)}: -1}
+	for i, fb := range chain {
+		p := fmt.Sprintf("%s.agent.fallback[%d]", prefix, i)
+		typ := strings.TrimSpace(fb.Type)
+		if typ == "" {
+			return fmt.Errorf("config: %s.type is required", p)
+		}
+		if typ != fb.Type {
+			return fmt.Errorf("config: %s.type %q has surrounding spaces", p, fb.Type)
+		}
+		if optModel, ok := fb.Options["model"]; ok {
+			s, isStr := optModel.(string)
+			if !isStr {
+				return fmt.Errorf("config: %s.options.model must be a string", p)
+			}
+			if fb.Model != "" && strings.TrimSpace(s) != strings.TrimSpace(fb.Model) {
+				return fmt.Errorf("config: %s sets model %q and options.model %q; use one", p, fb.Model, s)
+			}
+		}
+		if _, ok := fb.Options["fallback"]; ok {
+			return fmt.Errorf("config: %s.options.fallback is not allowed; fallback chains do not nest", p)
+		}
+		k := key{typ, fb.EffectiveModel()}
+		if prev, dup := seen[k]; dup {
+			if prev < 0 {
+				return fmt.Errorf("config: %s (%s, model %q) is the primary agent; a fallback must differ in type or model", p, typ, k.model)
+			}
+			return fmt.Errorf("config: %s repeats fallback[%d] (%s, model %q)", p, prev, typ, k.model)
+		}
+		seen[k] = i
+	}
+	return nil
 }
 
 // ProviderModelConfig defines a selectable model entry for a provider,
@@ -1134,6 +1234,9 @@ func (c *Config) validateInternal(permissive bool) error {
 			return err
 		}
 		if err := validateDisplayConfig(prefix+".display", proj.Display); err != nil {
+			return err
+		}
+		if err := validateAgentFallback(prefix, proj); err != nil {
 			return err
 		}
 	}

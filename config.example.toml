@@ -854,6 +854,33 @@ name = "my-backend"
 
 [projects.agent]
 type = "claudecode"
+# Optional: agent fallback chain / 可选：备用 agent 链
+# When a turn fails with a rate-limit (429), overloaded (529), or
+# subscription usage-limit error ("You've hit your session limit"),
+# cc-connect answers the same message with the next agent in this list, in
+# the same chat/thread, after a one-line notice. A fallback answers when the
+# previous fallback fails with any error. Each new message tries the primary
+# agent first again, unless the primary reported a reset time: then
+# fallback[0] answers directly until that time.
+# 当 turn 因限流 (429)、过载 (529) 或订阅用量上限失败时，cc-connect 会在同一会话中
+# 用下一个 agent 回答同一条消息，并先发一行提示。每条新消息都会先尝试主 agent；
+# 若主 agent 报告了恢复时间，则在该时间前直接使用 fallback[0]。
+#
+# - At most 3 entries; no entry may equal the primary (same type and model)
+#   or repeat another entry. / 最多 3 个；不能与主 agent 相同或重复。
+# - `model` is shorthand for options.model. `label` overrides the name in
+#   the notice. Other options (work_dir, mode, run_as_user) default to this
+#   agent's. / model 等同 options.model；label 改提示中的名称；其他选项默认继承主 agent。
+# - The fallback agent gets the last 6 user/assistant turns of the
+#   cc-connect session as plain-text context. Each agent keeps its own
+#   session, so the primary's --resume is untouched.
+#   fallback agent 会收到 cc-connect 会话最近 6 轮对话作为上下文；各 agent 会话独立。
+# - Not supported with mode = "multi-workspace". / 不支持 multi-workspace 模式。
+#
+# fallback = [
+#   { type = "opencode", model = "openai/gpt-6-sol" },
+#   { type = "opencode", model = "deepseek/deepseek-v4-pro" },
+# ]
 
 [projects.agent.options]
 work_dir = "/path/to/backend"
