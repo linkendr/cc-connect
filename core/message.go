@@ -459,6 +459,24 @@ const (
 	EventThinking          EventType = "thinking"           // thinking/processing status
 )
 
+// ErrorKind is a structured classification of agent errors so the engine can
+// decide how to react (fall back to another agent, surface, etc.) without
+// string-matching free-form error text. Agents set this when emitting an
+// EventError, or on an EventResult whose turn failed at the API layer; the
+// zero value ErrorKindUnknown means "not classified" and the engine falls
+// back to its default handling.
+type ErrorKind string
+
+const (
+	ErrorKindUnknown    ErrorKind = ""           // not classified; use default error surface
+	ErrorKindRateLimit  ErrorKind = "rate_limit" // HTTP 429 / Anthropic rate_limit_error — retriable
+	ErrorKindOverloaded ErrorKind = "overloaded" // HTTP 529 / Anthropic overloaded_error — retriable
+	// ErrorKindUsageLimit is a subscription usage cap (e.g. Claude Code's
+	// "You've hit your session limit · resets 3pm"). Retriable on another
+	// agent, not on the same one until the reset time.
+	ErrorKindUsageLimit ErrorKind = "usage_limit"
+)
+
 // UserQuestion represents a structured question from AskUserQuestion.
 type UserQuestion struct {
 	Question    string               `json:"question"`
@@ -489,7 +507,9 @@ type Event struct {
 	Questions                []UserQuestion // populated when ToolName == "AskUserQuestion"
 	Done                     bool
 	Error                    error
-	InputTokens              int // token usage from agent result events
+	ErrorKind                ErrorKind // classification for EventError / failed EventResult (zero = unknown)
+	ErrorResetAt             time.Time // when a retriable ErrorKind clears (usage-limit reset or now+retry-after); zero = unknown
+	InputTokens              int       // token usage from agent result events
 	OutputTokens             int
 	CacheCreationInputTokens int            // cache-write tokens (new content written to cache)
 	CacheReadInputTokens     int            // cache-read tokens (prior context retrieved from cache)

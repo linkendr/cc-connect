@@ -109,6 +109,11 @@ type claudeSession struct {
 	// when the session reuses the shared file (the common 99% case)
 	// or when there is nothing to append.
 	promptFilePath string
+
+	// Turn-failure classification state (see error_kind.go). Read-only
+	// observation of stream-json output; consumed by each result event.
+	lastAssistantErr atomic.Value // stores string: `error` of the latest assistant message
+	rejectedResetAt  atomic.Int64 // resetsAt of a "rejected" rate_limit_event (-1 = unknown reset, 0 = none)
 }
 
 // StartupWarning implements core.StartupWarner. Returns a non-empty string
@@ -593,8 +598,9 @@ func (cs *claudeSession) finishReadLoop(waitErrCh <-chan error, stderrBuf *bytes
 			stderrMsg = strings.TrimSpace(stderrBuf.String())
 		}
 		if stderrMsg != "" {
-			slog.Error("claudeSession: process failed", "error", err, "stderr", stderrMsg)
-			evt := core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrMsg)}
+			kind, resetAt := classifyStderrError(stderrMsg, cs.rejectedResetAt.Load(), time.Now())
+			slog.Error("claudeSession: process failed", "error", err, "stderr", stderrMsg, "kind", kind)
+			evt := core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrMsg), ErrorKind: kind, ErrorResetAt: resetAt}
 			select {
 			case cs.events <- evt:
 			case <-cs.ctx.Done():
@@ -658,6 +664,11 @@ func (cs *claudeSession) handleReadLoopLine(line string) {
 	case "control_cancel_request":
 		requestID, _ := raw["request_id"].(string)
 		slog.Debug("claudeSession: permission cancelled", "request_id", requestID)
+	case "rate_limit_event":
+		if resetAt, ok := parseRateLimitEvent(raw); ok {
+			cs.rejectedResetAt.Store(resetAt)
+			slog.Debug("claudeSession: rate limit event", "rejected_reset_at", resetAt)
+		}
 	default:
 		// Unknown event types are not silently dropped — they are logged
 		// at debug level with the full payload so future diagnosis of
@@ -963,6 +974,12 @@ func asInt(v any) int {
 }
 
 func (cs *claudeSession) handleAssistant(raw map[string]any) {
+	// An assistant message that wraps an API error carries a top-level
+	// `error` ("rate_limit", "overloaded", "billing_error", …). Remember it
+	// so the turn's result event can be classified (error_kind.go).
+	if apiErr, ok := raw["error"].(string); ok && apiErr != "" {
+		cs.lastAssistantErr.Store(apiErr)
+	}
 	msg, ok := raw["message"].(map[string]any)
 	if !ok {
 		return
@@ -1216,11 +1233,29 @@ func (cs *claudeSession) handleResult(raw map[string]any) {
 	}
 	cs.usageMu.Unlock()
 
+	// Classify a turn that failed at the API layer (usage cap, 429, 529).
+	// The event stays an EventResult so the default path (no fallback
+	// configured) shows exactly what it showed before; ErrorKind lets the
+	// engine answer with a fallback agent instead (adapted from PR #557).
+	var errKind core.ErrorKind
+	var errResetAt time.Time
+	if !isCompaction {
+		assistantErr, _ := cs.lastAssistantErr.Swap("").(string)
+		rejected := cs.rejectedResetAt.Swap(0)
+		errKind, errResetAt = classifyResultError(raw, assistantErr, rejected, time.Now())
+		if errKind != core.ErrorKindUnknown {
+			slog.Warn("claudeSession: turn failed with retriable backend error",
+				"kind", errKind, "subtype", resultSubtype(raw), "reset_at", errResetAt, "msg", resultErrorText(raw))
+		}
+	}
+
 	evt := core.Event{
 		Type:                     core.EventResult,
 		Content:                  content,
 		SessionID:                cs.CurrentSessionID(),
 		Done:                     !isCompaction,
+		ErrorKind:                errKind,
+		ErrorResetAt:             errResetAt,
 		InputTokens:              inputTokens,
 		OutputTokens:             outputTokens,
 		CacheCreationInputTokens: cacheCreationTokens,
