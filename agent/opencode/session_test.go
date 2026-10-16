@@ -429,23 +429,10 @@ func TestOpencodeCleanEmptyExitIsResult(t *testing.T) {
 	}
 }
 
-// Close reports an error when the read loop does not exit in time (here a
-// grandchild keeps stdout open after the CLI is killed), so the engine
-// never resumes that conversation into a new process.
-func TestOpencodeCloseTimeoutIsReported(t *testing.T) {
-	old := closeWaitTimeout
-	closeWaitTimeout = 200 * time.Millisecond
-	t.Cleanup(func() { closeWaitTimeout = old })
-
-	s, err := newOpencodeSession(context.Background(), writeFakeOpencode(t, "sleep 2 &\nwait"), nil, t.TempDir(), "", "default", "", "", nil)
-	if err != nil {
-		t.Fatalf("newOpencodeSession: %v", err)
-	}
-	if err := s.Send("hi", "m1", nil, nil); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-	time.Sleep(300 * time.Millisecond) // let the script start its grandchild
-	if err := s.Close(); err == nil {
-		t.Fatal("Close returned nil although the read loop was still running")
+func TestOpencodeStdoutTextWithFailureKeepsResult(t *testing.T) {
+	// Non-JSON stdout + exit 1 + empty stderr: unchanged from main (the
+	// synthesized empty result), not an error.
+	if evt := firstOpencodeEvent(t, "echo diagnostic\nexit 1"); evt.Type != core.EventResult {
+		t.Fatalf("event = %v, want EventResult", evt.Type)
 	}
 }

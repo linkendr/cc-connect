@@ -41,6 +41,10 @@ type opencodeSession struct {
 	resultSent        atomic.Bool // true when EventResult has been sent for this turn
 }
 
+// pipeWaitDelay bounds how long cmd.Wait waits for output pipes held open by
+// descendants after the child exited or was killed.
+const pipeWaitDelay = 2 * time.Second
+
 func newOpencodeSession(ctx context.Context, cmd string, extraArgs []string, workDir, model, mode, agentName, resumeID string, extraEnv []string) (*opencodeSession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
 
@@ -89,6 +93,12 @@ func (s *opencodeSession) Send(prompt string, messageID string, images []core.Im
 	slog.Debug("opencodeSession: launching", "resume", isResume, "args", core.RedactArgs(args))
 
 	cmd := exec.CommandContext(s.ctx, s.cmd, args...)
+	prepareProcessGroup(cmd)
+	// If a descendant outside the group still holds stdout/stderr open
+	// after the turn is cancelled (or the child exits), exec closes our ends
+	// of the pipes after this delay, so the read loop's scanner and Wait
+	// unblock and the goroutine exits.
+	cmd.WaitDelay = pipeWaitDelay
 	cmd.Dir = s.workDir
 	env := os.Environ()
 	if len(s.extraEnv) > 0 {
@@ -207,9 +217,10 @@ func (s *opencodeSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBu
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
 
-	parsedEvents := 0
+	sawStdout := false
 	for scanner.Scan() {
 		line := scanner.Text()
+		sawStdout = true
 		if line == "" {
 			continue
 		}
@@ -220,7 +231,6 @@ func (s *opencodeSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBu
 			continue
 		}
 
-		parsedEvents++
 		s.handleEvent(raw)
 	}
 
@@ -239,7 +249,7 @@ func (s *opencodeSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBu
 	// stderr copy, so stderrBuf is complete below).
 	exitErr := wait()
 	stderrMsg := stderrBuf.String()
-	if stderrMsg == "" && exitErr != nil && parsedEvents == 0 && s.ctx.Err() == nil {
+	if stderrMsg == "" && exitErr != nil && !sawStdout && s.ctx.Err() == nil {
 		// The process failed without a word (crash, kill, bad flag that
 		// prints nothing): report an error instead of synthesizing an empty
 		// successful result. Unclassified = provider-side for the agent
@@ -605,6 +615,9 @@ func (s *opencodeSession) Close() error {
 		close(s.events)
 	case <-time.After(closeWaitTimeout):
 		slog.Warn("opencodeSession: close timed out, abandoning wg.Wait")
+		// The process group is already killed (cancel); a stray
+		// descendant outside it may still hold the pipes, which exec closes
+		// after cmd.WaitDelay so the read loop still exits.
 		// Report it: the read loop (and possibly a child holding the
 		// output pipe) is still running, so the engine must not resume this
 		// conversation into a new process (it marks the key unsafe).
