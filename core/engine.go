@@ -4508,7 +4508,19 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 		// cleanly closed conversation.
 		e.consumeUnsafeResume(sessionKey)
 	}
-	if startSessionID != "" && (!closeSettled || e.consumeUnsafeResume(sessionKey)) {
+	unsafeResume := false
+	if startSessionID != "" {
+		if e.agentFallback != nil {
+			// Agent fallback chain: settle the marker on every fresh-start
+			// path, including an expired teardown wait, so a later clean
+			// restart does not discard a good conversation.
+			marked := e.consumeUnsafeResume(sessionKey)
+			unsafeResume = !closeSettled || marked
+		} else {
+			unsafeResume = !closeSettled || e.consumeUnsafeResume(sessionKey)
+		}
+	}
+	if unsafeResume {
 		slog.Warn("previous agent process not confirmed dead, starting a fresh session instead of resuming",
 			"session_key", sessionKey, "abandoned_session_id", startSessionID)
 		session.SetAgentSessionID("", agent.Name())
@@ -4853,13 +4865,17 @@ func (e *Engine) beginSessionClose(sessionKey string) func() {
 // could not be confirmed gone, in which case the caller must not resume its
 // agent session ID. Must NOT be called while holding interactiveMu — the
 // teardown itself can take up to closeTimeout.
+// sessionCloseWaitBudget is awaitSessionClose's budget. A var only so tests
+// can shorten it.
+var sessionCloseWaitBudget = closeTimeout + 30*time.Second
+
 func (e *Engine) awaitSessionClose(sessionKey string) bool {
 	if sessionKey == "" {
 		return true
 	}
 	// Budget slightly above the teardown's own ceiling so the close path
 	// always gets to resolve (and flag the session) before we give up.
-	deadline := time.After(closeTimeout + 30*time.Second)
+	deadline := time.After(sessionCloseWaitBudget)
 	start := time.Now()
 	waited := false
 	for {

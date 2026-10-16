@@ -2192,3 +2192,33 @@ func TestAgentFallback_FreshStartClearsUnsafeResume(t *testing.T) {
 		t.Errorf("start resume IDs = %q, want [\"\" \"conv-x\"]", ids)
 	}
 }
+
+// ---------- review round 9 ----------
+
+// R9-3: when the teardown wait expires, the start is fresh and the
+// unsafe-resume marker is settled too, so the next clean restart resumes
+// the new conversation.
+func TestAgentFallback_ExpiredTeardownWaitClearsUnsafeResume(t *testing.T) {
+	env := newFallbackEnv(t, nil, []scriptedTurn{okTurn("unused")})
+	old := sessionCloseWaitBudget
+	sessionCloseWaitBudget = 50 * time.Millisecond
+	t.Cleanup(func() { sessionCloseWaitBudget = old })
+	agent := &scriptedAgent{name: "fb-y", display: "Y", session: newScriptedSession("conv-y")}
+	const key = "test:k9"
+	sess := env.e.sessions.GetOrCreateActive(key)
+	sess.SetAgentSessionID("conv-old", "fb-y")
+	env.e.markUnsafeResume(key)
+	finish := env.e.beginSessionClose(key) // a teardown that outlives the wait
+
+	env.e.getOrCreateInteractiveStateWith(key, env.p, "ctx", sess, env.e.sessions, agent, "")
+	finish()
+	env.e.cleanupInteractiveState(key) // clean close
+	env.e.getOrCreateInteractiveStateWith(key, env.p, "ctx", sess, env.e.sessions, agent, "")
+
+	agent.mu.Lock()
+	ids := append([]string(nil), agent.startIDs...)
+	agent.mu.Unlock()
+	if len(ids) != 2 || ids[0] != "" || ids[1] != "conv-y" {
+		t.Errorf("start resume IDs = %q, want [\"\" \"conv-y\"]", ids)
+	}
+}
