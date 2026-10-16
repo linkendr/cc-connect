@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/chenhg5/cc-connect/core"
 )
@@ -377,5 +378,53 @@ func TestClassifyOpencodeText_Stderr(t *testing.T) {
 				t.Errorf("classifyOpencodeText(%q) = %q, want %q", tc.stderr, got, tc.want)
 			}
 		})
+	}
+}
+
+// writeFakeOpencode writes an executable stand-in for the opencode CLI.
+func writeFakeOpencode(t *testing.T, script string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "opencode")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+script+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func firstOpencodeEvent(t *testing.T, script string) core.Event {
+	t.Helper()
+	s, err := newOpencodeSession(context.Background(), writeFakeOpencode(t, script), nil, t.TempDir(), "", "default", "", "", nil)
+	if err != nil {
+		t.Fatalf("newOpencodeSession: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.Send("hi", "m1", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	select {
+	case evt := <-s.Events():
+		return evt
+	case <-time.After(5 * time.Second):
+		t.Fatal("no event")
+		return core.Event{}
+	}
+}
+
+// A silent crash (non-zero exit, no stdout, no stderr) is an error, not an
+// empty successful result.
+func TestOpencodeSilentCrashIsError(t *testing.T) {
+	evt := firstOpencodeEvent(t, "exit 1")
+	if evt.Type != core.EventError {
+		t.Fatalf("event = %v, want EventError", evt.Type)
+	}
+	if evt.ErrorKind != core.ErrorKindUnknown {
+		t.Errorf("ErrorKind = %q, want unclassified (provider-side)", evt.ErrorKind)
+	}
+}
+
+// A clean exit with no output keeps the existing synthesized result.
+func TestOpencodeCleanEmptyExitIsResult(t *testing.T) {
+	if evt := firstOpencodeEvent(t, "exit 0"); evt.Type != core.EventResult {
+		t.Fatalf("event = %v, want EventResult", evt.Type)
 	}
 }

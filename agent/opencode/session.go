@@ -193,11 +193,21 @@ func (s *opencodeSession) buildRunArgs(prompt string, imagePaths []string, chatI
 
 func (s *opencodeSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf *bytes.Buffer) {
 	defer s.wg.Done()
-	defer func() { _ = cmd.Wait() }()
+	waited := false
+	var waitErr error
+	wait := func() error {
+		if !waited {
+			waited = true
+			waitErr = cmd.Wait()
+		}
+		return waitErr
+	}
+	defer func() { _ = wait() }()
 
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
 
+	parsedEvents := 0
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" {
@@ -210,6 +220,7 @@ func (s *opencodeSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBu
 			continue
 		}
 
+		parsedEvents++
 		s.handleEvent(raw)
 	}
 
@@ -224,7 +235,23 @@ func (s *opencodeSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBu
 		return
 	}
 
+	// stdout is at EOF: collect the exit status (this also finishes the
+	// stderr copy, so stderrBuf is complete below).
+	exitErr := wait()
 	stderrMsg := stderrBuf.String()
+	if stderrMsg == "" && exitErr != nil && parsedEvents == 0 && s.ctx.Err() == nil {
+		// The process failed without a word (crash, kill, bad flag that
+		// prints nothing): report an error instead of synthesizing an empty
+		// successful result. Unclassified = provider-side for the agent
+		// fallback chain.
+		slog.Error("opencodeSession: process exited without output", "error", exitErr)
+		evt := core.Event{Type: core.EventError, Error: fmt.Errorf("opencode exited without output: %v", exitErr)}
+		select {
+		case s.events <- evt:
+		case <-s.ctx.Done():
+		}
+		return
+	}
 	if stderrMsg != "" {
 		slog.Error("opencodeSession: process error", "stderr", truncate(stderrMsg, 500))
 		if strings.Contains(stderrMsg, "Session not found") {
