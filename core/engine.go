@@ -4502,6 +4502,12 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	// (close reported a kill failure, timed out, or we gave up waiting for it).
 	// Starting fresh loses this conversation's history, but resuming would put
 	// two live agents on one transcript — both replying, both calling tools.
+	if startSessionID == "" && e.agentFallback != nil {
+		// Agent fallback chain: a fresh start also settles an unsafe-resume
+		// marker; otherwise the next start would discard this new,
+		// cleanly closed conversation.
+		e.consumeUnsafeResume(sessionKey)
+	}
 	if startSessionID != "" && (!closeSettled || e.consumeUnsafeResume(sessionKey)) {
 		slog.Warn("previous agent process not confirmed dead, starting a fresh session instead of resuming",
 			"session_key", sessionKey, "abandoned_session_id", startSessionID)
@@ -4627,6 +4633,19 @@ func (e *Engine) cleanupInteractiveState(sessionKey string, expected ...*interac
 	var agentSession AgentSession
 	var closePlatform Platform
 	var closeReplyCtx any
+	// Agent fallback chain: register the teardown before the session
+	// pointer is detached, under the same interactiveMu hold, so a /stop or
+	// a respawn that sees the detached state also sees the teardown
+	// (awaitSessionClose) and never resumes into the still-running process.
+	var finishEarlyClose func()
+	if e.agentFallback != nil && ok && state != nil {
+		state.mu.Lock()
+		hasSession := state.agentSession != nil
+		state.mu.Unlock()
+		if hasSession {
+			finishEarlyClose = e.beginSessionClose(sessionKey)
+		}
+	}
 	if ok && state != nil {
 		state.mu.Lock()
 		agentSession = state.agentSession
@@ -4640,6 +4659,9 @@ func (e *Engine) cleanupInteractiveState(sessionKey string, expected ...*interac
 		state.mu.Unlock()
 	}
 	e.interactiveMu.Unlock()
+	if e.agentFallback != nil && testHookCleanupDetached != nil {
+		testHookCleanupDetached(sessionKey)
+	}
 
 	// Notify senders of any queued messages that will never be processed.
 	if ok && state != nil {
@@ -4665,7 +4687,10 @@ func (e *Engine) cleanupInteractiveState(sessionKey string, expected ...*interac
 	// This prevents race conditions where /stop during cleanup sees
 	// an empty map and reports "No execution in progress" while
 	// the agent session Close() is still blocking (up to 130s).
-	if agentSession != nil {
+	if finishEarlyClose != nil {
+		e.closeAgentSession(sessionKey, agentSession, closePlatform, closeReplyCtx)
+		finishEarlyClose()
+	} else if agentSession != nil {
 		e.closeAgentSessionWithTimeout(sessionKey, agentSession, closePlatform, closeReplyCtx)
 	}
 
@@ -11229,6 +11254,13 @@ normalCleanup:
 		state.mu.Unlock()
 	}
 	e.closeAgentSessionAsync(sessionKey, agentSession, closePlatform, closeReplyCtx)
+	if e.agentFallback != nil && agentSession == nil {
+		// The session was already detached by a teardown in flight (e.g. a
+		// fallback retirement): wait for it (bounded by awaitSessionClose)
+		// before releasing the busy lock, so the next turn cannot start
+		// while that process may still be alive.
+		e.awaitSessionClose(sessionKey)
+	}
 
 	// The stopped turn can never run its own Unlock — release its busy lock
 	// so the next message starts a fresh turn instead of queueing behind a

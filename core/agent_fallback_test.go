@@ -2115,3 +2115,80 @@ func TestAgentFallback_PermissionAnsweredOnce(t *testing.T) {
 		t.Errorf("permission answers = %+v, want exactly one allow", perms)
 	}
 }
+
+// ---------- review round 8 ----------
+
+// R8-1: retiring fallback state A registers its teardown before detaching
+// the session, so a /stop that lands right after the detach sees it and
+// waits for A's close before releasing the busy lock (and a respawn waits
+// in awaitSessionClose instead of resuming into A's live process).
+func TestAgentFallback_TeardownRegisteredBeforeDetach(t *testing.T) {
+	env := newFallbackEnv(t, nil, []scriptedTurn{okTurn("unused")})
+	session := env.e.sessions.GetOrCreateActive(fallbackTestKey)
+	primary := &interactiveState{agentSession: newScriptedSession("p"), busySession: session, platform: env.p, replyCtx: "ctx"}
+	fbKey := fallbackStateKey(fallbackTestKey, 0)
+	fbSess := NewSessionManager("").GetOrCreateActive("fb")
+	if _, ok := fbSess.TryLock(); !ok {
+		t.Fatal("lock")
+	}
+	aSession := newScriptedSession("fa")
+	aSession.closeDelay = 100 * time.Millisecond // A's process takes a while to die
+	a := &interactiveState{agentSession: aSession, busySession: fbSess, platform: env.p, replyCtx: "ctx"}
+	chain := env.e.agentFallback
+	env.e.interactiveMu.Lock()
+	env.e.interactiveStates[fallbackTestKey] = primary
+	env.e.interactiveStates[fbKey] = a
+	env.e.interactiveMu.Unlock()
+	chain.bindState(fbKey, fallbackTestKey, a, chain.registerState(fbKey, fallbackTestKey))
+
+	registered := make(chan bool, 1)
+	stopSawClosed := make(chan bool, 1)
+	var once sync.Once
+	testHookCleanupDetached = func(key string) {
+		if key != fbKey {
+			return
+		}
+		once.Do(func() {
+			env.e.closingMu.Lock()
+			registered <- env.e.closingSessions[fbKey] != nil
+			env.e.closingMu.Unlock()
+			go func() {
+				env.e.stopInteractiveSession(fallbackTestKey, env.p, "ctx")
+				stopSawClosed <- aSession.closeFinished.Load()
+			}()
+		})
+	}
+	t.Cleanup(func() { testHookCleanupDetached = nil })
+
+	env.e.cleanupInteractiveState(fbKey, a) // A's retirement
+	if !<-registered {
+		t.Error("teardown not registered when the session was detached")
+	}
+	select {
+	case closed := <-stopSawClosed:
+		if !closed {
+			t.Error("/stop released the fallback before A's process was closed")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("/stop did not return")
+	}
+}
+
+// R8-4: a fresh start settles an unsafe-resume marker, so the next start
+// resumes the new, cleanly closed conversation.
+func TestAgentFallback_FreshStartClearsUnsafeResume(t *testing.T) {
+	env := newFallbackEnv(t, nil, []scriptedTurn{okTurn("unused")})
+	agent := &scriptedAgent{name: "fb-x", display: "X", session: newScriptedSession("conv-x")}
+	const key = "test:k4"
+	env.e.markUnsafeResume(key)
+	sess := env.e.sessions.GetOrCreateActive(key)
+	env.e.getOrCreateInteractiveStateWith(key, env.p, "ctx", sess, env.e.sessions, agent, "")
+	env.e.cleanupInteractiveState(key) // closes cleanly
+	env.e.getOrCreateInteractiveStateWith(key, env.p, "ctx", sess, env.e.sessions, agent, "")
+	agent.mu.Lock()
+	ids := append([]string(nil), agent.startIDs...)
+	agent.mu.Unlock()
+	if len(ids) != 2 || ids[0] != "" || ids[1] != "conv-x" {
+		t.Errorf("start resume IDs = %q, want [\"\" \"conv-x\"]", ids)
+	}
+}

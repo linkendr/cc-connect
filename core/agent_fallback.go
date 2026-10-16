@@ -407,6 +407,11 @@ var testHookStopAfterCapture func()
 // loop right before a permission request is published to state.pending.
 var testHookBeforePermissionPublish func()
 
+// testHookCleanupDetached, when set by a test, runs in
+// cleanupInteractiveState right after the agent session was detached from
+// the state (interactiveMu released), before it is closed.
+var testHookCleanupDetached func(key string)
+
 // testHookAfterStateRemoved, when set by a test, runs right after
 // cleanupInteractiveState removed a state from interactiveStates.
 var testHookAfterStateRemoved func(key string)
