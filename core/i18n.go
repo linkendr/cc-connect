@@ -554,6 +554,14 @@ const (
 	MsgPsEmpty           MsgKey = "ps_empty"
 	MsgPsNoSession       MsgKey = "ps_no_session"
 
+	// Agent fallback chain notices (see agent_fallback.go). Distinct from
+	// MsgRateLimited, which is cc-connect's own inbound throttle.
+	MsgAgentFallbackUsageLimit MsgKey = "agent_fallback_usage_limit"
+	MsgAgentFallbackRateLimit  MsgKey = "agent_fallback_rate_limit"
+	MsgAgentFallbackOverloaded MsgKey = "agent_fallback_overloaded"
+	MsgAgentFallbackFailed     MsgKey = "agent_fallback_failed"
+	MsgAgentFallbackBlocked    MsgKey = "agent_fallback_blocked"
+
 	MsgWhoamiTitle     MsgKey = "whoami_title"
 	MsgWhoamiCardTitle MsgKey = "whoami_card_title"
 	MsgWhoamiName      MsgKey = "whoami_name"
@@ -3412,6 +3420,43 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "⏳ 訊息發送過快，請稍後再試。",
 		LangJapanese:           "⏳ メッセージの送信が速すぎます。しばらくお待ちください。",
 		LangSpanish:            "⏳ Estás enviando mensajes demasiado rápido. Espera un momento.",
+	},
+	// Agent fallback notices. args: failed agent label, fallback agent label.
+	MsgAgentFallbackUsageLimit: {
+		LangEnglish:            "%s hit its usage limit; answering with %s",
+		LangChinese:            "%s 已达用量上限，改由 %s 回答",
+		LangTraditionalChinese: "%s 已達用量上限，改由 %s 回答",
+		LangJapanese:           "%s が利用上限に達しました。%s で回答します",
+		LangSpanish:            "%s alcanzó su límite de uso; responde %s",
+	},
+	MsgAgentFallbackRateLimit: {
+		LangEnglish:            "%s is rate limited; answering with %s",
+		LangChinese:            "%s 被限流，改由 %s 回答",
+		LangTraditionalChinese: "%s 被限流，改由 %s 回答",
+		LangJapanese:           "%s がレート制限中です。%s で回答します",
+		LangSpanish:            "%s tiene límite de tasa; responde %s",
+	},
+	MsgAgentFallbackOverloaded: {
+		LangEnglish:            "%s is overloaded; answering with %s",
+		LangChinese:            "%s 过载，改由 %s 回答",
+		LangTraditionalChinese: "%s 過載，改由 %s 回答",
+		LangJapanese:           "%s が過負荷です。%s で回答します",
+		LangSpanish:            "%s está sobrecargado; responde %s",
+	},
+	MsgAgentFallbackFailed: {
+		LangEnglish:            "%s failed; answering with %s",
+		LangChinese:            "%s 出错，改由 %s 回答",
+		LangTraditionalChinese: "%s 出錯，改由 %s 回答",
+		LangJapanese:           "%s が失敗しました。%s で回答します",
+		LangSpanish:            "%s falló; responde %s",
+	},
+	// args: primary agent label, reset time (local clock), fallback agent label.
+	MsgAgentFallbackBlocked: {
+		LangEnglish:            "%s is at its usage limit until %s; answering with %s",
+		LangChinese:            "%s 用量上限持续到 %s，改由 %s 回答",
+		LangTraditionalChinese: "%s 用量上限持續到 %s，改由 %s 回答",
+		LangJapanese:           "%s は %s まで利用上限です。%s で回答します",
+		LangSpanish:            "%s está en su límite de uso hasta %s; responde %s",
 	},
 	MsgPsSent: {
 		LangEnglish:            "✅ P.S. delivered.",

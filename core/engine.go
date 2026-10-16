@@ -484,6 +484,9 @@ type Engine struct {
 	// Interactive agent session management
 	interactiveMu     sync.Mutex
 	interactiveStates map[string]*interactiveState // key = sessionKey
+	// agentFallback answers turns the primary agent cannot serve (rate/usage
+	// limit, overloaded) with other agents. nil = disabled. See agent_fallback.go.
+	agentFallback *agentFallbackChain
 
 	// Teardown tracking. A session's state is removed from interactiveStates
 	// as soon as /stop is issued, but its OS process can live on for up to
@@ -601,6 +604,15 @@ type interactiveState struct {
 	// currentTurnUserMessageTimeMs is the UserMessageTimeMs for the in-flight
 	// foreground turn (including a queued turn after EventResult).
 	currentTurnUserMessageTimeMs int64
+
+	// Agent fallback chain (agent_fallback.go). fallbackIntercept selects
+	// which failures processInteractiveEvents hands back to its caller;
+	// turnInput is the message of the in-flight turn, so the caller can
+	// answer it with a fallback agent; isFallbackState marks the state of a
+	// fallback agent (no auto-compress).
+	fallbackIntercept fallbackIntercept
+	turnInput         queuedMessage
+	isFallbackState   bool
 }
 
 // latestUserMessageWatermarkLocked returns the highest UserMessageTimeMs among
@@ -2445,6 +2457,7 @@ func (e *Engine) Stop() error {
 	if err := e.agent.Stop(); err != nil {
 		errs = append(errs, fmt.Errorf("stop agent %s: %w", e.agent.Name(), err))
 	}
+	errs = append(errs, e.stopFallbackAgents()...)
 	if len(errs) > 0 {
 		return fmt.Errorf("engine stop errors: %v", errs)
 	}
@@ -3581,9 +3594,12 @@ func (e *Engine) handlePendingPermission(p Platform, msg *Message, content strin
 		// platform permission button callbacks.
 		e.interactiveMu.Lock()
 		prefix := iKey + "#cron:"
+		// A fallback agent answering for this session may also wait on a
+		// permission (agent_fallback.go).
+		fallbackPrefix := iKey + "#fallback:"
 		var cronKeys []string
 		for k := range e.interactiveStates {
-			if strings.HasPrefix(k, prefix) {
+			if strings.HasPrefix(k, prefix) || strings.HasPrefix(k, fallbackPrefix) {
 				cronKeys = append(cronKeys, k)
 			}
 		}
@@ -3995,7 +4011,23 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	stopRecallMonitor := e.startMessageRecallMonitor(interactiveKey)
 	defer stopRecallMonitor()
 
-	if state.agentSession == nil {
+	// Agent fallback chain (agent_fallback.go): when the primary reported a
+	// limit reset time that has not passed, answer with the fallback chain
+	// without sending to the primary. Multi-workspace agents never use it.
+	fallbackChain := e.agentFallback
+	if agent != e.agent {
+		fallbackChain = nil
+	}
+	var blockedCause turnOutcome
+	skipPrimary := false
+	if fallbackChain != nil {
+		if until, kind, blocked := fallbackChain.primaryBlocked(); blocked {
+			skipPrimary = true
+			blockedCause = turnOutcome{Intercepted: true, Kind: kind, ResetAt: until, blocked: true, Input: queuedMessageFromMessage(p, msg)}
+		}
+	}
+
+	if state.agentSession == nil && !skipPrimary {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgFailedToStartAgentSession))
 		return
 	}
@@ -4047,37 +4079,53 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	state.mu.Lock()
 	needResync := state.eventsNeedResync
 	state.mu.Unlock()
-	if needResync {
+	if needResync && state.agentSession != nil {
 		drainEvents(state.agentSession.Events())
 	}
 
-	promptContent := e.buildSenderPrompt(msg.Content, msg.UserID, msg.UserName, msg.Platform, msg.SessionKey, msg.ChannelKey)
-
-	sendStart := time.Now()
-	state.mu.Lock()
-	state.currentMessageID = msg.MessageID
-	state.fromVoice = msg.FromVoice
-	state.sideText = ""
-	as := state.agentSession // capture under lock to avoid race with cleanup
-	state.mu.Unlock()
-
-	// Run Send concurrently with processInteractiveEvents. Some agents block inside
-	// Send until the prompt turn finishes (e.g. ACP session/prompt); they may emit
-	// EventPermissionRequest while blocked — the event loop must run in parallel.
-	sendDone := make(chan error, 1)
-	go func() {
-		if as == nil {
-			sendDone <- fmt.Errorf("agent session became nil")
-			return
+	if skipPrimary {
+		// The fallback turn runs its own typing indicator.
+		if stopTyping != nil {
+			stopTyping()
+			stopTyping = nil
 		}
-		sendDone <- as.Send(promptContent, msg.MessageID, msg.Images, msg.Files)
-	}()
+		e.answerWithFallbacks(session, sessions, interactiveKey, ccSessionKey, blockedCause)
+	} else {
+		promptContent := e.buildSenderPrompt(msg.Content, msg.UserID, msg.UserName, msg.Platform, msg.SessionKey, msg.ChannelKey)
 
-	e.processInteractiveEvents(state, session, sessions, interactiveKey, msg.MessageID, turnStart, stopTyping, sendDone, msg.ReplyCtx, lockGen)
-	if elapsed := time.Since(sendStart); elapsed >= slowAgentSend {
-		slog.Warn("slow agent send", "elapsed", elapsed, "session", msg.SessionKey, "content_len", len(msg.Content))
+		sendStart := time.Now()
+		state.mu.Lock()
+		state.currentMessageID = msg.MessageID
+		state.fromVoice = msg.FromVoice
+		state.sideText = ""
+		if fallbackChain != nil {
+			state.fallbackIntercept = interceptRetriable
+			state.turnInput = queuedMessageFromMessage(p, msg)
+		}
+		as := state.agentSession // capture under lock to avoid race with cleanup
+		state.mu.Unlock()
+
+		// Run Send concurrently with processInteractiveEvents. Some agents block inside
+		// Send until the prompt turn finishes (e.g. ACP session/prompt); they may emit
+		// EventPermissionRequest while blocked — the event loop must run in parallel.
+		sendDone := make(chan error, 1)
+		go func() {
+			if as == nil {
+				sendDone <- fmt.Errorf("agent session became nil")
+				return
+			}
+			sendDone <- as.Send(promptContent, msg.MessageID, msg.Images, msg.Files)
+		}()
+
+		outcome := e.processInteractiveEvents(state, session, sessions, interactiveKey, msg.MessageID, turnStart, stopTyping, sendDone, msg.ReplyCtx, lockGen)
+		if elapsed := time.Since(sendStart); elapsed >= slowAgentSend {
+			slog.Warn("slow agent send", "elapsed", elapsed, "session", msg.SessionKey, "content_len", len(msg.Content))
+		}
+		stopTyping = nil // ownership transferred; prevent defer from double-stopping
+		if outcome.Intercepted {
+			e.answerWithFallbacks(session, sessions, interactiveKey, ccSessionKey, outcome)
+		}
 	}
-	stopTyping = nil // ownership transferred; prevent defer from double-stopping
 
 	// Start unsolicited reader and arm the idle close timer BEFORE draining
 	// queued messages. drainPendingMessages releases the session lock, and
@@ -4560,6 +4608,7 @@ func (e *Engine) cleanupInteractiveState(sessionKey string, expected ...*interac
 	}
 	delete(e.interactiveStates, sessionKey)
 	e.interactiveMu.Unlock()
+	e.cleanupFallbackStates(sessionKey)
 }
 
 func (e *Engine) cancelAgentSessionIdleClose(state *interactiveState) {
@@ -5186,7 +5235,12 @@ var agentErrorHandlers = []agentErrorHandler{
 	{"Session not found", MsgSessionNotFound},
 }
 
-func (e *Engine) processInteractiveEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, msgID string, turnStart time.Time, stopTypingFn func(), sendDone <-chan error, replyCtx any, lockGen uint64) {
+// processInteractiveEvents runs the event loop for a turn (and any queued
+// turns it picks up). It returns a zero turnOutcome when the turn was handled.
+// When state.fallbackIntercept is set (agent fallback chain), a matching
+// failure is not shown; the loop returns Intercepted=true with the failed
+// message so the caller can answer it with a fallback agent.
+func (e *Engine) processInteractiveEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, msgID string, turnStart time.Time, stopTypingFn func(), sendDone <-chan error, replyCtx any, lockGen uint64) (outcome turnOutcome) {
 	if msgID != "" {
 		state.mu.Lock()
 		state.currentMessageID = msgID
@@ -5224,6 +5278,8 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 	state.mu.Lock()
 	workspaceDir := state.workspaceDir
+	intercept := state.fallbackIntercept
+	isFallbackState := state.isFallbackState
 	replyAgent := state.agent
 	if replyAgent == nil {
 		replyAgent = e.agent
@@ -5287,6 +5343,26 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 	events := state.agentSession.Events()
 	stopCh := state.stopSignal()
+
+	// interceptTurn ends the turn without showing the failure and reports
+	// it to the caller (agent fallback chain).
+	interceptTurn := func(kind ErrorKind, resetAt time.Time, errText string) turnOutcome {
+		cp.Finalize(ProgressCardStateFailed)
+		sp.discard()
+		if pendingSend != nil {
+			if err := <-pendingSend; err != nil {
+				slog.Debug("async send error during intercepted failure", "error", err)
+			}
+			pendingSend = nil
+		}
+		state.mu.Lock()
+		in := state.turnInput
+		state.mu.Unlock()
+		slog.Warn("agent turn failed; handing it to the fallback chain",
+			"session_key", sessionKey, "kind", kind, "reset_at", resetAt, "error", errText)
+		return turnOutcome{Intercepted: true, Kind: kind, ResetAt: resetAt, ErrText: errText, Input: in}
+	}
+
 	for {
 		var event Event
 		var ok bool
@@ -5301,6 +5377,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 		case err := <-pendingSend:
 			pendingSend = nil
+			if err != nil && intercept == interceptAnyError {
+				return interceptTurn(ErrorKindUnknown, time.Time{}, err.Error())
+			}
 			if err != nil {
 				slog.Error("failed to send prompt", "error", err, "session_key", sessionKey)
 				sp.discard()
@@ -5964,6 +6043,21 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				)
 				continue
 			}
+			if intercept.catchesResult(event) {
+				// The turn failed at the API layer (e.g. Claude's usage cap);
+				// the process is alive and the turn is over. Keep tracking the
+				// agent session ID so the primary's --resume stays correct.
+				if state.agentSession != nil {
+					if currentID := state.agentSession.CurrentSessionID(); currentID != "" && session.GetAgentSessionID() != currentID {
+						session.SetAgentSessionID(currentID, e.agent.Name())
+						sessions.Save()
+					}
+				}
+				state.mu.Lock()
+				state.eventsNeedResync = false
+				state.mu.Unlock()
+				return interceptTurn(event.ErrorKind, event.ErrorResetAt, event.Content)
+			}
 			cp.Finalize(ProgressCardStateCompleted)
 			// Use state.agentSession.CurrentSessionID() instead of event.SessionID.
 			// event.SessionID may be empty in some cases, causing the agent_session_id
@@ -6361,7 +6455,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 
 			// Auto-compress after finishing a turn, before sending any queued messages.
-			if triggerAutoCompress {
+			if triggerAutoCompress && !isFallbackState {
 				compressor, ok := e.agent.(ContextCompressor)
 				if ok && compressor.CompressCommand() != "" {
 					if pendingSend != nil {
@@ -6411,6 +6505,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				state.currentMessageID = queued.messageID
 				state.fromVoice = queued.fromVoice
 				state.currentTurnUserMessageTimeMs = queued.userMessageTimeMs
+				state.turnInput = queued
 				state.mu.Unlock()
 
 				// Stop the previous turn's typing indicator
@@ -6550,6 +6645,22 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			return
 
 		case EventError:
+			if intercept.catchesError(event) {
+				if state.agentSession != nil {
+					if currentID := state.agentSession.CurrentSessionID(); currentID != "" && session.GetAgentSessionID() != currentID {
+						session.SetAgentSessionID(currentID, e.agent.Name())
+						sessions.Save()
+					}
+				}
+				state.mu.Lock()
+				state.eventsNeedResync = true
+				state.mu.Unlock()
+				errText := ""
+				if event.Error != nil {
+					errText = event.Error.Error()
+				}
+				return interceptTurn(event.ErrorKind, event.ErrorResetAt, errText)
+			}
 			cp.Finalize(ProgressCardStateFailed)
 			sp.discard()
 			// A backend can create its resumable session before a turn fails
@@ -6604,6 +6715,14 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 channelClosed:
 	// Channel closed - process exited unexpectedly
 	slog.Warn("agent process exited", "session_key", sessionKey)
+	if intercept == interceptAnyError && len(textParts) == 0 {
+		// A fallback agent died without answering: let the next one try.
+		state.mu.Lock()
+		state.eventsNeedResync = true
+		state.mu.Unlock()
+		e.cleanupInteractiveState(sessionKey, state)
+		return interceptTurn(ErrorKindUnknown, time.Time{}, "agent process exited")
+	}
 	state.mu.Lock()
 	state.eventsNeedResync = true
 	state.mu.Unlock()
@@ -6665,6 +6784,7 @@ channelClosed:
 			}
 		}
 	}
+	return
 }
 
 func mergeRichToolResult(steps []ToolStep, event Event, result string, maxLen int) []ToolStep {
@@ -6762,9 +6882,23 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		state.currentMessageID = queued.messageID
 		state.fromVoice = queued.fromVoice
 		state.currentTurnUserMessageTimeMs = queued.userMessageTimeMs
+		state.turnInput = queued
+		primaryWithFallback := state.fallbackIntercept == interceptRetriable
 		state.mu.Unlock()
 
 		e.i18n.DetectAndSet(queued.content)
+
+		// Agent fallback chain: while the primary is inside a known limit
+		// window, queued messages go straight to the fallback agents.
+		if primaryWithFallback && e.agentFallback != nil {
+			if until, kind, blocked := e.agentFallback.primaryBlocked(); blocked {
+				session.AddHistory("user", queued.content)
+				sessions.Save()
+				e.answerWithFallbacks(session, sessions, sessionKey, "", turnOutcome{Intercepted: true, Kind: kind, ResetAt: until, blocked: true, Input: queued})
+				continue
+			}
+		}
+
 		prompt := e.buildSenderPrompt(queued.content, queued.userID, queued.userName, queued.msgPlatform, queued.msgSessionKey, queued.channelKey)
 
 		state.mu.Lock()
@@ -6795,7 +6929,9 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		}
 
 		slog.Info("processing queued message", "session", sessionKey)
-		e.processInteractiveEvents(state, session, sessions, sessionKey, queued.messageID, time.Now(), stopTyping, sendDone, queued.replyCtx, lockGen)
+		if outcome := e.processInteractiveEvents(state, session, sessions, sessionKey, queued.messageID, time.Now(), stopTyping, sendDone, queued.replyCtx, lockGen); outcome.Intercepted {
+			e.answerWithFallbacks(session, sessions, sessionKey, "", outcome)
+		}
 	}
 }
 
@@ -10699,6 +10835,8 @@ func (e *Engine) stopInteractiveSessionWithOptions(sessionKey string, notifyQueu
 		e.interactiveMu.Unlock()
 		return false
 	}
+	// Also stop a fallback agent that is answering for this session.
+	defer e.stopFallbackStates(sessionKey, notifyQueued)
 
 	// Stop unsolicited reader before touching state to avoid races.
 	e.stopUnsolicitedReader(state)
@@ -16370,6 +16508,9 @@ func (e *Engine) relayContextForSourceSessionKey(fromProject, sourceSessionKey s
 // HandleRelay processes a relay message synchronously: starts or resumes a
 // dedicated relay session, sends the message to the agent, and blocks until
 // the complete response is collected (or the relay context times out).
+//
+// TODO(agent-fallback): relay turns do not use the agent fallback chain
+// (agent_fallback.go); a primary usage-limit error is returned to the caller.
 func (e *Engine) HandleRelay(ctx context.Context, fromProject, sourceSessionKey, message string) (string, error) {
 	agent, sessions, relaySessionKey, err := e.relayContextForSourceSessionKey(fromProject, sourceSessionKey)
 	if err != nil {
