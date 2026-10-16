@@ -196,6 +196,9 @@ func normalizeMode(raw string) string {
 
 func (a *Agent) Name() string { return "opencode" }
 
+// DisplayName implements core.AgentDisplayNamer (agent fallback notices).
+func (a *Agent) DisplayName() string { return "OpenCode" }
+
 func (a *Agent) SetWorkDir(dir string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()

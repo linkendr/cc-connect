@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -419,6 +420,12 @@ func main() {
 		}
 
 		engine := core.NewEngine(proj.Name, agent, platforms, sessionFile, lang)
+		fallbackSpecs, err := buildAgentFallbackSpecs(cfg.DataDir, proj, core.ListRegisteredAgents())
+		if err != nil {
+			slog.Error("invalid agent fallback chain", "project", proj.Name, "error", err)
+			os.Exit(1)
+		}
+		engine.SetAgentFallbacks(fallbackSpecs)
 		// Wire display settings including show_context_indicator and reply_footer
 		// Global [display] config can be overridden by project-level settings
 		_, _, _, _, _, showCtx, showFooter, _ := config.EffectiveDisplay(cfg, &proj)
@@ -1957,6 +1964,46 @@ func convertProviderModels(ms []config.ProviderModelConfig) []core.ModelOption {
 		opts[i] = core.ModelOption{Name: m.Model, Alias: m.Alias}
 	}
 	return opts
+}
+
+// fallbackInheritedOptions are primary agent options a fallback agent gets
+// unless its own entry sets them: same working tree, same permission mode,
+// same OS-level isolation.
+var fallbackInheritedOptions = []string{"work_dir", "mode", "run_as_user", "run_as_env"}
+
+// buildAgentFallbackSpecs turns [projects.agent].fallback into engine specs.
+// registered lists the agent types compiled into this binary; an unknown type
+// is a startup error, like an unknown primary type.
+func buildAgentFallbackSpecs(dataDir string, proj config.ProjectConfig, registered []string) ([]core.AgentFallbackSpec, error) {
+	if len(proj.Agent.Fallback) == 0 {
+		return nil, nil
+	}
+	known := make(map[string]bool, len(registered))
+	for _, name := range registered {
+		known[name] = true
+	}
+	primary := buildAgentOptions(dataDir, proj)
+	specs := make([]core.AgentFallbackSpec, 0, len(proj.Agent.Fallback))
+	for i, fb := range proj.Agent.Fallback {
+		if !known[fb.Type] {
+			names := append([]string(nil), registered...)
+			sort.Strings(names)
+			return nil, fmt.Errorf("agent.fallback[%d]: unknown agent type %q (compiled in: %s)", i, fb.Type, strings.Join(names, ", "))
+		}
+		opts := fb.EffectiveOptions()
+		for _, k := range fallbackInheritedOptions {
+			if _, set := opts[k]; set {
+				continue
+			}
+			if v, ok := primary[k]; ok {
+				opts[k] = v
+			}
+		}
+		opts["cc_data_dir"] = dataDir
+		opts["cc_project"] = proj.Name
+		specs = append(specs, core.AgentFallbackSpec{Type: fb.Type, Options: opts, Label: fb.Label})
+	}
+	return specs, nil
 }
 
 func buildAgentOptions(dataDir string, proj config.ProjectConfig) map[string]any {

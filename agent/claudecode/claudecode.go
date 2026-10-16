@@ -357,6 +357,9 @@ func (a *Agent) Name() string           { return "claudecode" }
 func (a *Agent) CLIBinaryName() string  { return a.cmd }
 func (a *Agent) CLIDisplayName() string { return "Claude" }
 
+// DisplayName implements core.AgentDisplayNamer (agent fallback notices).
+func (a *Agent) DisplayName() string { return "Claude Code" }
+
 func (a *Agent) SetWorkDir(dir string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
