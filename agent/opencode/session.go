@@ -415,13 +415,40 @@ func (s *opencodeSession) handleReasoning(raw map[string]any) {
 
 func (s *opencodeSession) handleError(raw map[string]any) {
 	errMsg := extractErrorMessage(raw)
-	slog.Error("opencodeSession: agent error", "error", errMsg)
-	evt := core.Event{Type: core.EventError, Error: fmt.Errorf("%s", errMsg)}
+	kind := classifyOpencodeError(raw, errMsg)
+	slog.Error("opencodeSession: agent error", "error", errMsg, "kind", kind)
+	evt := core.Event{Type: core.EventError, Error: fmt.Errorf("%s", errMsg), ErrorKind: kind}
 	select {
 	case s.events <- evt:
 	case <-s.ctx.Done():
 		return
 	}
+}
+
+// classifyOpencodeError marks the OpenCode errors that are user-caused or
+// terminal, so an agent fallback chain does not hand them to the next agent:
+// an aborted message (MessageAbortedError) and a prompt that exceeds the
+// model's context window. Everything else stays unclassified, which the
+// chain treats as provider-side (auth, quota, rate limit, API errors).
+// Without a fallback chain the engine ignores ErrorKind on EventError.
+func classifyOpencodeError(raw map[string]any, msg string) core.ErrorKind {
+	name := ""
+	if errObj, ok := raw["error"].(map[string]any); ok {
+		name, _ = errObj["name"].(string)
+	}
+	switch name {
+	case "MessageAbortedError":
+		return core.ErrorKindCancelled
+	case "ContextOverflowError", "ContextWindowExceededError":
+		return core.ErrorKindContextTooLong
+	}
+	low := strings.ToLower(msg)
+	for _, p := range []string{"context_length_exceeded", "maximum context length", "context window", "prompt is too long"} {
+		if strings.Contains(low, p) {
+			return core.ErrorKindContextTooLong
+		}
+	}
+	return core.ErrorKindUnknown
 }
 
 // extractErrorMessage tries to pull a human-readable message from various

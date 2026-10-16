@@ -336,3 +336,25 @@ func TestHandleToolUseErrorNoMessageNoText(t *testing.T) {
 
 // verify Agent implements core.Agent
 var _ core.Agent = (*Agent)(nil)
+
+func TestClassifyOpencodeError(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  map[string]any
+		want core.ErrorKind
+	}{
+		{"aborted", map[string]any{"error": map[string]any{"name": "MessageAbortedError", "data": map[string]any{"message": "aborted"}}}, core.ErrorKindCancelled},
+		{"context overflow name", map[string]any{"error": map[string]any{"name": "ContextOverflowError"}}, core.ErrorKindContextTooLong},
+		{"context length text", map[string]any{"error": map[string]any{"name": "APIError", "data": map[string]any{"message": "This model's maximum context length is 128000 tokens"}}}, core.ErrorKindContextTooLong},
+		{"auth is provider-side", map[string]any{"error": map[string]any{"name": "ProviderAuthError", "data": map[string]any{"message": "invalid api key"}}}, core.ErrorKindUnknown},
+		{"rate limit is provider-side", map[string]any{"error": map[string]any{"name": "APIError", "data": map[string]any{"message": "429 rate limit"}}}, core.ErrorKindUnknown},
+		{"unknown is provider-side", map[string]any{"error": "boom"}, core.ErrorKindUnknown},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyOpencodeError(tc.raw, extractErrorMessage(tc.raw)); got != tc.want {
+				t.Errorf("classifyOpencodeError = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
