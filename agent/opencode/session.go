@@ -603,11 +603,19 @@ func (s *opencodeSession) Close() error {
 	select {
 	case <-done:
 		close(s.events)
-	case <-time.After(8 * time.Second):
+	case <-time.After(closeWaitTimeout):
 		slog.Warn("opencodeSession: close timed out, abandoning wg.Wait")
+		// Report it: the read loop (and possibly a child holding the
+		// output pipe) is still running, so the engine must not resume this
+		// conversation into a new process (it marks the key unsafe).
+		return fmt.Errorf("opencode: read loop did not exit within %s", closeWaitTimeout)
 	}
 	return nil
 }
+
+// closeWaitTimeout bounds how long Close waits for the read loop. A var
+// only so tests can shorten it.
+var closeWaitTimeout = 8 * time.Second
 
 func truncate(s string, maxRunes int) string {
 	if utf8.RuneCountInString(s) <= maxRunes {
