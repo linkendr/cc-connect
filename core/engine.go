@@ -616,6 +616,22 @@ type interactiveState struct {
 	fallbackIntercept fallbackIntercept
 	turnInput         queuedMessage
 	isFallbackState   bool
+	// dispatchCh serializes guarded fallback-chain sends against /stop
+	// (guardedDispatch); stopRequested is raised by /stop before it takes
+	// that gate. Both unused without a fallback chain.
+	dispatchCh    chan struct{}
+	stopRequested atomic.Bool
+}
+
+// dispatchGate returns the state's one-slot dispatch gate, creating it on
+// first use.
+func (s *interactiveState) dispatchGate() chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.dispatchCh == nil {
+		s.dispatchCh = make(chan struct{}, 1)
+	}
+	return s.dispatchCh
 }
 
 // latestUserMessageWatermarkLocked returns the highest UserMessageTimeMs among
@@ -3234,6 +3250,11 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		st, hasSt := e.interactiveStates[interactiveKey]
 		agentAlive := hasSt && st != nil && st.agentSession != nil && st.agentSession.Alive()
 		e.interactiveMu.Unlock()
+		// A fallback agent answering for this conversation keeps the lock
+		// live although the primary process is dead (agent_fallback.go).
+		if !agentAlive && e.agentFallback != nil && e.fallbackTurnInProgress(interactiveKey) {
+			agentAlive = true
+		}
 		if !agentAlive && e.staleLockBreakAfter > 0 {
 			if since, broken := session.BreakStaleLock(e.staleLockBreakAfter); broken {
 				heldFor := time.Since(since).Round(time.Second)
@@ -4621,6 +4642,7 @@ func (e *Engine) cleanupInteractiveState(sessionKey string, expected ...*interac
 	}
 	delete(e.interactiveStates, sessionKey)
 	e.interactiveMu.Unlock()
+	e.agentFallback.forget(sessionKey)
 	e.cleanupFallbackStates(sessionKey)
 }
 
@@ -4725,10 +4747,15 @@ func (e *Engine) cleanupInteractiveStateForIdleToken(sessionKey string, expected
 	e.closeAgentSessionWithTimeout(sessionKey, agentSession, closePlatform, closeReplyCtx)
 
 	e.interactiveMu.Lock()
+	removed := false
 	if currentState, currentOk := e.interactiveStates[sessionKey]; currentOk && currentState == expected {
 		delete(e.interactiveStates, sessionKey)
+		removed = true
 	}
 	e.interactiveMu.Unlock()
+	if removed {
+		e.agentFallback.forget(sessionKey)
+	}
 }
 
 // beginSessionClose registers an in-flight teardown for sessionKey and returns
@@ -6918,6 +6945,14 @@ func (e *Engine) notifyDroppedQueuedMessages(state *interactiveState, reason err
 func (e *Engine) drainPendingMessages(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, lockGen uint64) bool {
 	for {
 		state.mu.Lock()
+		if e.agentFallback != nil && state.fallbackIntercept == interceptRetriable && !session.HoldsLock(lockGen) {
+			// Agent fallback chain: this drain no longer owns the turn (a
+			// nested drain released generation lockGen and a newer turn
+			// took the lock, or /stop released it). Leave the queue to the
+			// current owner; never pop work of another generation.
+			state.mu.Unlock()
+			return false
+		}
 		if len(state.pendingMessages) == 0 {
 			session.Unlock(lockGen)
 			state.mu.Unlock()
@@ -6981,7 +7016,7 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 			e.send(queued.platform, queued.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "session reset"))
 			return false
 		}
-		if (as == nil || !as.Alive()) && fallbackDrain {
+		if fallbackDrain && (as == nil || !as.Alive()) {
 			// The primary died on a retriable failure (e.g. claude exited on
 			// a 429). Start it again for this queued message instead of
 			// dropping the queue; the new state adopts the remaining queue
@@ -7035,8 +7070,10 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 				sendDone <- fmt.Errorf("agent session became nil")
 				return
 			}
-			if fallbackDrain && !turnLive(sendState) {
-				sendDone <- errTurnCancelled
+			if fallbackDrain {
+				sendDone <- guardedDispatch(sendState, func() bool { return turnLive(sendState) }, func() error {
+					return as.Send(prompt, queued.messageID, queued.images, queued.files)
+				})
 				return
 			}
 			sendDone <- as.Send(prompt, queued.messageID, queued.images, queued.files)
@@ -10967,6 +11004,13 @@ func (e *Engine) stopInteractiveSessionSilently(sessionKey string) bool {
 }
 
 func (e *Engine) stopInteractiveSessionWithOptions(sessionKey string, notifyQueued bool) bool {
+	if e.agentFallback != nil {
+		// Agent fallback chain: make this stop mutually exclusive with a
+		// guarded send for the turn (see guardedDispatch).
+		if release := e.acquireDispatchForStop(sessionKey); release != nil {
+			defer release()
+		}
+	}
 	e.interactiveMu.Lock()
 	state, ok := e.interactiveStates[sessionKey]
 	if !ok || state == nil {
@@ -11024,6 +11068,9 @@ func (e *Engine) stopInteractiveSessionWithOptions(sessionKey string, notifyQueu
 		if state.busySession != nil && state.busySession.ForceUnlock() {
 			slog.Info("session busy lock released after turn cancel", "session_key", sessionKey)
 		}
+		// The state stays in use; the bumped lock generation now cancels
+		// any dispatch of the cancelled turn.
+		state.stopRequested.Store(false)
 
 		slog.Info("agent session turn cancelled, session kept alive",
 			"session_key", sessionKey)
@@ -11066,8 +11113,30 @@ normalCleanup:
 		Event:      HookEventSessionEnded,
 		SessionKey: sessionKey,
 	})
+	e.agentFallback.forget(sessionKey)
 
 	return true
+}
+
+// acquireDispatchForStop raises stopRequested on the session's state and
+// takes its dispatch gate (bounded by stopDispatchWait). Returns the release
+// func, or nil when there is no state or the wait timed out.
+func (e *Engine) acquireDispatchForStop(sessionKey string) func() {
+	e.interactiveMu.Lock()
+	st := e.interactiveStates[sessionKey]
+	e.interactiveMu.Unlock()
+	if st == nil {
+		return nil
+	}
+	st.stopRequested.Store(true)
+	gate := st.dispatchGate()
+	select {
+	case gate <- struct{}{}:
+		return func() { <-gate }
+	case <-time.After(stopDispatchWait):
+		slog.Warn("stop: dispatch still inside Send; stopping the running turn", "session_key", sessionKey)
+		return nil
+	}
 }
 
 func (e *Engine) cmdCompress(p Platform, msg *Message) {

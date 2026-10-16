@@ -223,6 +223,17 @@ func (c *agentFallbackChain) registerState(fbKey, interactiveKey string) {
 	c.owned[fbKey] = interactiveKey
 }
 
+// forget removes a fallback state from the registry once the engine has
+// removed the state itself (cleanup, /stop, idle close). Nil-safe.
+func (c *agentFallbackChain) forget(key string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.owned, key)
+}
+
 // ownerOf returns the conversation key of a registered fallback state.
 func (c *agentFallbackChain) ownerOf(key string) (string, bool) {
 	if c == nil {
@@ -265,6 +276,64 @@ func (c *agentFallbackChain) hookKeyMapper(ev HookEvent) (HookEvent, bool) {
 	}
 	ev.SessionKey = owner
 	return ev, true
+}
+
+// fallbackTurnInProgress reports whether a fallback agent is answering a
+// turn for interactiveKey (its fallback session busy lock is held). The
+// stale-lock self-heal must not break the conversation's busy lock then,
+// even though the primary process is dead.
+func (e *Engine) fallbackTurnInProgress(interactiveKey string) bool {
+	if e.agentFallback == nil {
+		return false
+	}
+	for _, key := range e.agentFallback.ownedStatesOf(interactiveKey) {
+		e.interactiveMu.Lock()
+		st := e.interactiveStates[key]
+		e.interactiveMu.Unlock()
+		if st == nil {
+			continue
+		}
+		st.mu.Lock()
+		busy := st.busySession
+		st.mu.Unlock()
+		if busy != nil && busy.Busy() {
+			return true
+		}
+	}
+	return false
+}
+
+// stopDispatchWait bounds how long /stop waits for a guarded dispatch that
+// is already inside Send (agents such as ACP block in Send for the whole
+// turn; that turn is then simply stopped like any running turn). A var only
+// so tests can shorten it.
+var stopDispatchWait = 2 * time.Second
+
+// testHookGuardedDispatch, when set by a test, runs inside a guarded
+// dispatch between its ownership check and the final pre-Send check.
+var testHookGuardedDispatch func()
+
+// guardedDispatch runs send for a turn owned by owner, mutually exclusive
+// with /stop on owner: /stop first raises owner.stopRequested, then takes
+// the same dispatch gate before it marks anything stopped. A dispatch that
+// holds the gate re-checks stopRequested and live() right before send, so
+// a stop that began at any point before that check prevents delivery; a
+// stop that begins later waits until Send has returned and then stops the
+// running turn. Returns errTurnCancelled when the turn is no longer live.
+func guardedDispatch(owner *interactiveState, live func() bool, send func() error) error {
+	gate := owner.dispatchGate()
+	gate <- struct{}{}
+	defer func() { <-gate }()
+	if owner.stopRequested.Load() || !live() {
+		return errTurnCancelled
+	}
+	if hook := testHookGuardedDispatch; hook != nil {
+		hook()
+	}
+	if owner.stopRequested.Load() || !live() {
+		return errTurnCancelled
+	}
+	return send()
 }
 
 // errTurnCancelled is reported on sendDone when a guarded send finds its
@@ -464,6 +533,15 @@ func (e *Engine) runFallbackTurn(guard fallbackGuard, i int, agent Agent, fbSess
 		slog.Info("agent fallback: turn cancelled", "session_key", interactiveKey, "index", i, "stage", "before_state")
 		return turnOutcome{Cancelled: true}
 	}
+	// The fallback session has its own busy lock: one turn at a time per
+	// fallback state, so two turns can never share its event channel.
+	fbGen, locked := fbSession.TryLock()
+	if !locked {
+		slog.Warn("agent fallback: fallback agent busy with another turn", "session_key", interactiveKey, "index", i)
+		e.send(in.platform, in.replyCtx, e.i18n.T(MsgPreviousProcessing))
+		return turnOutcome{Failed: true}
+	}
+	defer fbSession.Unlock(fbGen)
 	chain.registerState(fbKey, interactiveKey)
 	state := e.getOrCreateInteractiveStateWith(fbKey, in.platform, in.replyCtx, fbSession, fbSessions, agent, ccKey)
 	// Re-check now that the state is registered: a /stop that ran before
@@ -512,14 +590,21 @@ func (e *Engine) runFallbackTurn(guard fallbackGuard, i int, agent Agent, fbSess
 		// StartTyping blocked, or before this goroutine ran) has marked the
 		// primary and this state stopped and released the busy lock by now.
 		// processInteractiveEvents then ends the turn silently.
-		if guard.cancelled(e) || state.isStopped() {
-			slog.Info("agent fallback: turn cancelled", "session_key", interactiveKey, "index", i, "stage", "send")
-			sendDone <- errTurnCancelled
-			return
+		owner := guard.primary
+		if owner == nil {
+			owner = state
 		}
-		sendDone <- as.Send(prompt, in.messageID, in.images, in.files)
+		err := guardedDispatch(owner, func() bool {
+			return !guard.cancelled(e) && !state.isStopped()
+		}, func() error {
+			return as.Send(prompt, in.messageID, in.images, in.files)
+		})
+		if errors.Is(err, errTurnCancelled) {
+			slog.Info("agent fallback: turn cancelled", "session_key", interactiveKey, "index", i, "stage", "send")
+		}
+		sendDone <- err
 	}()
-	out := e.processInteractiveEvents(state, fbSession, fbSessions, fbKey, in.messageID, time.Now(), stopTyping, sendDone, in.replyCtx, 0)
+	out := e.processInteractiveEvents(state, fbSession, fbSessions, fbKey, in.messageID, time.Now(), stopTyping, sendDone, in.replyCtx, fbGen)
 
 	state.mu.Lock()
 	state.fallbackIntercept = interceptNone

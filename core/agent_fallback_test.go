@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -56,6 +57,7 @@ type scriptedSession struct {
 	closeAfter map[int]bool       // close the event channel after emitting turn n
 	onAllow    scriptedTurn       // emitted when a permission is allowed
 	perms      []PermissionResult // RespondPermission calls
+	aliveCalls atomic.Int32       // Alive() call count
 }
 
 func newScriptedSession(id string, turns ...scriptedTurn) *scriptedSession {
@@ -121,6 +123,7 @@ func (s *scriptedSession) Close() error {
 // Alive reads the mutex-guarded flag; the embedded stub's plain bool would
 // race with a Close from the engine's async teardown.
 func (s *scriptedSession) Alive() bool {
+	s.aliveCalls.Add(1)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return !s.closed && !s.dead
@@ -1236,5 +1239,299 @@ func TestAgentFallback_EmptyChainDrainKeepsLifecycle(t *testing.T) {
 	}
 	if idle {
 		t.Error("drain armed the idle close without a fallback chain")
+	}
+}
+
+// ---------- review round 3 ----------
+
+// setDispatchHook installs testHookGuardedDispatch for one test: it signals
+// entered and blocks until release is closed (first dispatch only).
+func setDispatchHook(t *testing.T) (entered, release chan struct{}) {
+	t.Helper()
+	entered, release = make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	testHookGuardedDispatch = func() {
+		once.Do(func() {
+			close(entered)
+			<-release
+		})
+	}
+	t.Cleanup(func() { testHookGuardedDispatch = nil })
+	return entered, release
+}
+
+func (env *fallbackEnv) primaryState() *interactiveState {
+	env.e.interactiveMu.Lock()
+	defer env.e.interactiveMu.Unlock()
+	return env.e.interactiveStates[fallbackTestKey]
+}
+
+func waitTrue(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// R3-1a: /stop starts while a fallback send sits between its ownership
+// check and Send: the send is refused and nothing reaches the agent; /stop
+// completes after the dispatch let go.
+func TestAgentFallback_StopBetweenCheckAndSendFallback(t *testing.T) {
+	env := newFallbackEnv(t,
+		[]scriptedTurn{usageLimitTurn(time.Time{})},
+		[]scriptedTurn{okTurn("must not run")},
+	)
+	entered, release := setDispatchHook(t)
+	cancelled := watchLog(t, "agent fallback: turn cancelled")
+
+	env.receive("question")
+	waitClosed(t, entered, "guarded dispatch")
+	st := env.primaryState()
+	stopDone := make(chan bool, 1)
+	go func() { stopDone <- env.e.stopInteractiveSession(fallbackTestKey, env.p, "ctx") }()
+	waitTrue(t, "/stop to request the stop", st.stopRequested.Load)
+	select {
+	case <-stopDone:
+		t.Fatal("/stop completed while a dispatch held the gate")
+	default:
+	}
+	close(release)
+	waitClosed(t, cancelled, "cancelled dispatch")
+	select {
+	case ok := <-stopDone:
+		if !ok {
+			t.Fatal("/stop found no session")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("/stop did not complete")
+	}
+	if got := env.fbs[0].session.prompts(); len(got) != 0 {
+		t.Errorf("stopped prompt reached the fallback agent: %q", got)
+	}
+}
+
+// R3-1b: same window on the drain path after a dead-primary restart.
+func TestAgentFallback_StopBetweenCheckAndSendRestartedPrimary(t *testing.T) {
+	env := newFallbackEnv(t, nil, []scriptedTurn{okTurn("unused")})
+	dead := newScriptedSession("dead-sid")
+	dead.dead = true
+	fresh := newScriptedSession("fresh-sid", okTurn("must not run"))
+	env.primary.session = dead
+	env.primary.more = []*scriptedSession{fresh}
+	env.primary.starts = 1 // the dead primary was started once already
+	st, session, gen := env.drainFixture(dead, true)
+	entered, release := setDispatchHook(t)
+
+	drained := make(chan struct{})
+	go func() {
+		env.e.drainPendingMessages(st, session, env.e.sessions, fallbackTestKey, gen)
+		close(drained)
+	}()
+	waitClosed(t, entered, "guarded dispatch")
+	restarted := env.primaryState()
+	if restarted == st {
+		t.Fatal("primary was not restarted")
+	}
+	stopDone := make(chan bool, 1)
+	go func() { stopDone <- env.e.stopInteractiveSession(fallbackTestKey, env.p, "ctx") }()
+	waitTrue(t, "/stop to request the stop", restarted.stopRequested.Load)
+	close(release)
+	waitClosed(t, drained, "drain")
+	<-stopDone
+	if got := fresh.prompts(); len(got) != 0 {
+		t.Errorf("stopped prompt reached the restarted primary: %q", got)
+	}
+}
+
+// R3-2: after a nested drain released generation G and a newer turn holds
+// G+1 with C queued, the old drain leaves C alone; C is processed exactly
+// once, by the owner, and never reported as "session reset".
+func TestAgentFallback_StaleDrainLeavesNewerQueue(t *testing.T) {
+	env := newFallbackEnv(t, nil, []scriptedTurn{okTurn("unused")})
+	primary := newScriptedSession("primary-sid", okTurn("answer to C"))
+	env.primary.session = primary
+	st, session, oldGen := env.drainFixture(primary, true)
+	session.Unlock(oldGen) // nested drain (auto-compress) released G
+	newGen, ok := session.TryLock()
+	if !ok {
+		t.Fatal("turn B could not take the lock")
+	}
+
+	if env.e.drainPendingMessages(st, session, env.e.sessions, fallbackTestKey, oldGen) {
+		t.Fatal("stale drain claims it unlocked the session")
+	}
+	st.mu.Lock()
+	queued := len(st.pendingMessages)
+	st.mu.Unlock()
+	if queued != 1 {
+		t.Fatalf("stale drain touched the newer queue: %d left, want 1", queued)
+	}
+	if len(primary.prompts()) != 0 || env.sentContaining("session reset") != 0 {
+		t.Fatalf("stale drain processed or dropped C; sent = %#v", env.p.getSent())
+	}
+
+	// B's drain owns the queue and processes C once.
+	if !env.e.drainPendingMessages(st, session, env.e.sessions, fallbackTestKey, newGen) {
+		t.Fatal("owner drain did not unlock")
+	}
+	env.waitSent("answer to C")
+	if got := len(primary.prompts()); got != 1 {
+		t.Errorf("C sent %d times, want 1", got)
+	}
+	if env.sentContaining("session reset") != 0 {
+		t.Errorf("C reported as session reset: %#v", env.p.getSent())
+	}
+}
+
+// R3-3a: the primary died on a retriable error and a fallback answers for
+// longer than the stale-lock threshold: a new message must not break the
+// lock and start a second turn.
+func TestAgentFallback_StaleLockKeepsLiveFallbackTurn(t *testing.T) {
+	env := newFallbackEnv(t,
+		[]scriptedTurn{errorTurn(`API Error: {"error":{"type":"rate_limit_error"}}`, ErrorKindRateLimit)},
+		[]scriptedTurn{okTurn("fallback answer")},
+	)
+	env.e.SetStaleLockBreakAfter(time.Nanosecond) // every held lock looks stale
+	env.primary.session.dieAfter = map[int]bool{0: true}
+	entered, release := gate(env.fbs[0].session, 0)
+
+	env.receive("first")
+	waitClosed(t, entered, "fallback turn")
+	env.receive("second")
+	if got := env.sentContaining("Previous request still processing"); got != 1 {
+		t.Errorf("second message not rejected as still processing; sent = %#v", env.p.getSent())
+	}
+	if got := env.sentContaining("会话卡锁已自动恢复"); got != 0 {
+		t.Errorf("stale-lock recovery broke a live fallback turn's lock")
+	}
+	close(release)
+	env.waitSent("fallback answer")
+	env.waitIdle()
+	if got := env.primary.StartCount(); got != 1 {
+		t.Errorf("primary started %d times, want 1", got)
+	}
+	if got := len(env.fbs[0].session.prompts()); got != 1 {
+		t.Errorf("fallback got %d prompts, want 1", got)
+	}
+}
+
+// R3-3b: a second fallback run for the same conversation while the first
+// is in flight is refused by the fallback session's busy lock, so the
+// fallback state never gets two senders or two readers.
+func TestAgentFallback_FallbackStateBusyLockRejectsSecondTurn(t *testing.T) {
+	env := newFallbackEnv(t,
+		[]scriptedTurn{usageLimitTurn(time.Time{})},
+		[]scriptedTurn{okTurn("fallback answer")},
+	)
+	entered, release := gate(env.fbs[0].session, 0)
+	env.receive("first")
+	waitClosed(t, entered, "fallback turn")
+
+	st := env.primaryState()
+	session := env.e.sessions.GetOrCreateActive(fallbackTestKey)
+	session.mu.Lock()
+	gen := session.lockGen
+	session.mu.Unlock()
+	second := make(chan struct{})
+	go func() {
+		guard := fallbackGuard{primary: st, session: session, sessions: env.e.sessions, lockGen: gen, interactiveKey: fallbackTestKey}
+		env.e.answerWithFallbacks(guard, turnOutcome{Intercepted: true, Kind: ErrorKindRateLimit, Input: queuedMessage{
+			messageID: "m2", platform: env.p, replyCtx: "ctx", content: "second", msgSessionKey: fallbackTestKey,
+		}})
+		close(second)
+	}()
+	select {
+	case <-second:
+	case <-time.After(3 * time.Second):
+		t.Fatal("second fallback run did not return (it shared the busy fallback state)")
+	}
+	if got := len(env.fbs[0].session.prompts()); got != 1 {
+		t.Errorf("fallback got %d prompts, want 1", got)
+	}
+	if got := env.sentContaining("Previous request still processing"); got != 1 {
+		t.Errorf("second run not rejected; sent = %#v", env.p.getSent())
+	}
+	close(release)
+	env.waitSent("fallback answer")
+	env.waitIdle()
+}
+
+// R3-4: registry entries go away with their state, so a real conversation
+// whose key happens to equal an old fallback state key is left alone.
+func TestAgentFallback_RegistryForgetsRemovedStates(t *testing.T) {
+	var mu sync.Mutex
+	var got []HookEvent
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var ev HookEvent
+		_ = json.NewDecoder(r.Body).Decode(&ev)
+		mu.Lock()
+		got = append(got, ev)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	env := newFallbackEnv(t,
+		[]scriptedTurn{usageLimitTurn(time.Time{})},
+		[]scriptedTurn{okTurn("fallback one")},
+	)
+	// cleanupInteractiveState closes both sessions; the second message gets
+	// fresh ones.
+	env.primary.more = []*scriptedSession{newScriptedSession("primary-sid-2", usageLimitTurn(time.Time{}))}
+	env.fbs[0].more = []*scriptedSession{newScriptedSession("fb0-sid-2", okTurn("fallback two"))}
+	async := false
+	env.e.SetHooks(NewHookManager("test", []HookConfig{{Event: "message.sent", Type: "http", URL: srv.URL, Async: &async}}, "sh", "-c", ""))
+	fbKey := fallbackStateKey(fallbackTestKey, 0)
+
+	// Cleanup path.
+	env.send("one")
+	env.waitSent("fallback one")
+	if _, ok := env.e.agentFallback.ownerOf(fbKey); !ok {
+		t.Fatal("fallback state not registered after its turn")
+	}
+	env.e.cleanupInteractiveState(fallbackTestKey)
+	if _, ok := env.e.agentFallback.ownerOf(fbKey); ok {
+		t.Error("registry kept a cleaned-up fallback state")
+	}
+
+	// /stop path.
+	env.send("two")
+	env.waitSent("fallback two")
+	env.e.stopInteractiveSession(fallbackTestKey, env.p, "ctx")
+	if _, ok := env.e.agentFallback.ownerOf(fbKey); ok {
+		t.Error("registry kept a stopped fallback state")
+	}
+	if keys := env.e.agentFallback.ownedStatesOf(fallbackTestKey); len(keys) != 0 {
+		t.Errorf("cleanup/permission lookup would still target %v", keys)
+	}
+
+	// A real conversation using that literal key passes through unchanged.
+	mu.Lock()
+	got = nil
+	mu.Unlock()
+	env.e.hooks.Emit(HookEvent{Event: HookEventMessageSent, SessionKey: fbKey})
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 1 || got[0].SessionKey != fbKey {
+		t.Errorf("real key rewritten: %+v", got)
+	}
+}
+
+// R3-5: without a chain, the drain calls the agent's Alive() exactly once
+// before Send, as on main.
+func TestAgentFallback_EmptyChainDrainAliveCalls(t *testing.T) {
+	env := newFallbackEnv(t, nil)
+	primary := newScriptedSession("primary-sid", okTurn("queued answer"))
+	env.primary.session = primary
+	atSend := make(chan int32, 1)
+	primary.beforeTurn = func(int) { atSend <- primary.aliveCalls.Load() }
+	st, session, gen := env.drainFixture(primary, false)
+	env.e.drainPendingMessages(st, session, env.e.sessions, fallbackTestKey, gen)
+	if got := <-atSend; got != 1 {
+		t.Errorf("Alive() called %d times before Send, want 1 (main)", got)
 	}
 }
