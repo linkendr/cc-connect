@@ -153,12 +153,6 @@ func (a *scriptedAgent) StartSession(_ context.Context, _ string) (AgentSession,
 	}
 	return a.session, nil
 }
-
-func (a *scriptedAgent) current() *scriptedSession {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.session
-}
 func (a *scriptedAgent) ListSessions(_ context.Context) ([]AgentSessionInfo, error) { return nil, nil }
 func (a *scriptedAgent) Stop() error                                                { return nil }
 func (a *scriptedAgent) StartCount() int {
