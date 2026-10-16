@@ -60,6 +60,7 @@ func TestAgentFallback_Validate(t *testing.T) {
 		mode         string
 		runAsUser    string
 		runAsEnv     []string
+		primaryOpts  map[string]any
 		chain        []FallbackAgentConfig
 		wantErr      string // "" = valid
 	}{
@@ -84,6 +85,12 @@ func TestAgentFallback_Validate(t *testing.T) {
 		{name: "run_as_env project cannot fall back to opencode", runAsEnv: []string{"FOO"}, chain: []fb{{Type: "opencode"}}, wantErr: "does not support run_as_user"},
 		{name: "run_as_user in fallback options for opencode", chain: []fb{{Type: "opencode", Options: map[string]any{"run_as_user": "agent"}}}, wantErr: "does not support run_as_user"},
 		{name: "run_as_user project may fall back to claudecode", runAsUser: "agent", primaryModel: "opus", chain: []fb{{Type: "claudecode", Model: "sonnet"}}},
+		{name: "integer run_as_user in primary options", primaryOpts: map[string]any{"run_as_user": int64(7)}, chain: []fb{{Type: "claudecode", Model: "sonnet"}}, wantErr: "agent.options.run_as_user must be a string, got int64"},
+		{name: "integer run_as_user in claudecode fallback", runAsUser: "agent", primaryModel: "opus", chain: []fb{{Type: "claudecode", Model: "sonnet", Options: map[string]any{"run_as_user": int64(42)}}}, wantErr: "fallback[0].options.run_as_user must be a string, got int64"},
+		{name: "string run_as_env in claudecode fallback", primaryModel: "opus", chain: []fb{{Type: "claudecode", Model: "sonnet", Options: map[string]any{"run_as_env": "FOO"}}}, wantErr: "fallback[0].options.run_as_env must be a list of strings, got string"},
+		{name: "non-string run_as_env item", primaryModel: "opus", chain: []fb{{Type: "claudecode", Model: "sonnet", Options: map[string]any{"run_as_env": []any{"FOO", int64(1)}}}}, wantErr: "run_as_env[1] must be a string, got int64"},
+		{name: "dangerous run_as_env in fallback", primaryModel: "opus", chain: []fb{{Type: "claudecode", Model: "sonnet", Options: map[string]any{"run_as_env": []any{"LD_PRELOAD"}}}}, wantErr: "dangerous variable"},
+		{name: "valid run_as options in claudecode fallback", primaryModel: "opus", chain: []fb{{Type: "claudecode", Model: "sonnet", Options: map[string]any{"run_as_user": "agent", "run_as_env": []any{"FOO"}}}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -94,6 +101,9 @@ func TestAgentFallback_Validate(t *testing.T) {
 			}
 			proj.Mode = tc.mode
 			proj.RunAsUser = tc.runAsUser
+			for k, v := range tc.primaryOpts {
+				proj.Agent.Options[k] = v
+			}
 			proj.RunAsEnv = tc.runAsEnv
 			proj.Agent.Fallback = tc.chain
 			err := validateAgentFallback("projects[0]", proj)

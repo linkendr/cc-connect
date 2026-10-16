@@ -636,6 +636,42 @@ func (f FallbackAgentConfig) EffectiveModel() string {
 // so a project that isolates its primary agent cannot fall back to it.
 var runAsCapableAgentTypes = map[string]bool{"claudecode": true}
 
+// validateRunAsOptions checks the shape of run_as_user (a valid user name
+// string) and run_as_env (a list of variable-name strings) in an agent
+// options map. Used for projects with a fallback chain.
+func validateRunAsOptions(prefix string, opts map[string]any) error {
+	if v, ok := opts["run_as_user"]; ok {
+		name, isStr := v.(string)
+		if !isStr {
+			return fmt.Errorf("config: %s.run_as_user must be a string, got %T", prefix, v)
+		}
+		if err := validateRunAsUser(prefix, name); err != nil {
+			return err
+		}
+	}
+	if v, ok := opts["run_as_env"]; ok {
+		var names []string
+		switch env := v.(type) {
+		case []string:
+			names = env
+		case []any:
+			for i, item := range env {
+				s, isStr := item.(string)
+				if !isStr {
+					return fmt.Errorf("config: %s.run_as_env[%d] must be a string, got %T", prefix, i, item)
+				}
+				names = append(names, s)
+			}
+		default:
+			return fmt.Errorf("config: %s.run_as_env must be a list of strings, got %T", prefix, v)
+		}
+		if err := validateRunAsEnv(prefix, names); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // validateAgentFallback checks [projects.agent].fallback: known shape, at
 // most MaxAgentFallbacks entries, no entry that is the primary agent itself
 // or repeats an earlier entry (either would loop the chain back onto an agent
@@ -652,8 +688,15 @@ func validateAgentFallback(prefix string, proj ProjectConfig) error {
 	if proj.Mode == "multi-workspace" {
 		return fmt.Errorf("config: %s.agent.fallback is not supported with mode = \"multi-workspace\"", prefix)
 	}
+	// Isolation options are inherited by fallbacks, and agent/claudecode
+	// silently ignores a value of the wrong type (an int run_as_user becomes
+	// "", i.e. no isolation). Reject malformed values before inheritance.
+	if err := validateRunAsOptions(prefix+".agent.options", proj.Agent.Options); err != nil {
+		return err
+	}
 	_, primaryRunAs := proj.Agent.Options["run_as_user"]
-	isolated := proj.RunAsUser != "" || len(proj.RunAsEnv) > 0 || primaryRunAs
+	_, primaryRunAsEnv := proj.Agent.Options["run_as_env"]
+	isolated := proj.RunAsUser != "" || len(proj.RunAsEnv) > 0 || primaryRunAs || primaryRunAsEnv
 	type key struct{ typ, model string }
 	primaryModel, _ := proj.Agent.Options["model"].(string)
 	seen := map[key]int{{strings.TrimSpace(proj.Agent.Type), strings.TrimSpace(primaryModel)}: -1}
@@ -684,6 +727,9 @@ func validateAgentFallback(prefix string, proj ProjectConfig) error {
 					return fmt.Errorf("config: %s.options.%s must be a string, got %T", p, opt, v)
 				}
 			}
+		}
+		if err := validateRunAsOptions(p+".options", fb.Options); err != nil {
+			return err
 		}
 		_, ownRunAs := fb.Options["run_as_user"]
 		_, ownRunAsEnv := fb.Options["run_as_env"]
