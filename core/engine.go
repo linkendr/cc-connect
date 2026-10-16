@@ -588,6 +588,9 @@ type interactiveState struct {
 	// to confirm it has exited before starting a new foreground turn.
 	unsolicitedCancel context.CancelFunc // nil when no reader is running
 	unsolicitedDone   chan struct{}      // closed when the reader goroutine exits
+	// unsolicitedLingering is the done channel of a reader that did not exit
+	// within unsolicitedReaderStopTimeout (nil = none known).
+	unsolicitedLingering chan struct{}
 
 	// agentSessionIdleCancel 取消当前会话的 idle 关闭计时器。
 	agentSessionIdleCancel context.CancelFunc
@@ -908,6 +911,9 @@ func (e *Engine) reapIdleWorkspaces() {
 // SetHooks configures the lifecycle event hook manager.
 func (e *Engine) SetHooks(hm *HookManager) {
 	e.hooks = hm
+	if e.agentFallback != nil {
+		e.hooks.setEventMapper(e.agentFallback.hookKeyMapper)
+	}
 }
 
 // SetShell configures the shell binary, flag, and shell profile used for exec.
@@ -3594,16 +3600,17 @@ func (e *Engine) handlePendingPermission(p Platform, msg *Message, content strin
 		// platform permission button callbacks.
 		e.interactiveMu.Lock()
 		prefix := iKey + "#cron:"
-		// A fallback agent answering for this session may also wait on a
-		// permission (agent_fallback.go).
-		fallbackPrefix := iKey + "#fallback:"
 		var cronKeys []string
 		for k := range e.interactiveStates {
-			if strings.HasPrefix(k, prefix) || strings.HasPrefix(k, fallbackPrefix) {
+			if strings.HasPrefix(k, prefix) {
 				cronKeys = append(cronKeys, k)
 			}
 		}
 		e.interactiveMu.Unlock()
+		// A fallback agent answering for this session may also wait on a
+		// permission (agent_fallback.go). Only registered fallback states
+		// count; nil chain = no extra keys.
+		cronKeys = append(cronKeys, e.agentFallback.ownedStatesOf(iKey)...)
 		// If multiple cron runs coexist for the same session, pick
 		// the first with a pending permission. In practice only one
 		// cron run per session should be in the pending state at a
@@ -4953,7 +4960,8 @@ func buildCardContent(thinking string, tools []cardToolEntry, answer string) str
 // are short (blocking adapter calls like RespondPermission are offloaded), so
 // this timeout should almost always be non-binding. If it does fire, callers
 // force a resync of the Events channel to preserve single-reader correctness.
-const unsolicitedReaderStopTimeout = 5 * time.Second
+// A var (not const) only so tests can shorten it.
+var unsolicitedReaderStopTimeout = 5 * time.Second
 
 // stopUnsolicitedReader cancels any running unsolicited reader goroutine and
 // waits (bounded) for it to exit. If the reader does not exit in time, the
@@ -4988,7 +4996,36 @@ func (e *Engine) stopUnsolicitedReader(state *interactiveState) {
 		// silently steal foreground events.
 		state.mu.Lock()
 		state.eventsNeedResync = true
+		// Remember the reader that has not exited, so callers that need
+		// exclusive ownership of Events() (stopUnsolicitedReaderConfirmed)
+		// can tell. Nothing else reads this field.
+		state.unsolicitedLingering = done
 		state.mu.Unlock()
+	}
+}
+
+// stopUnsolicitedReaderConfirmed stops the unsolicited reader like
+// stopUnsolicitedReader and reports whether no reader goroutine is left
+// running — including one that outlived an earlier stop timeout. Used by
+// the agent fallback chain before it hands Events() to a queued turn.
+func (e *Engine) stopUnsolicitedReaderConfirmed(state *interactiveState) bool {
+	e.stopUnsolicitedReader(state)
+	state.mu.Lock()
+	lingering := state.unsolicitedLingering
+	state.mu.Unlock()
+	if lingering == nil {
+		return true
+	}
+	select {
+	case <-lingering:
+		state.mu.Lock()
+		if state.unsolicitedLingering == lingering {
+			state.unsolicitedLingering = nil
+		}
+		state.mu.Unlock()
+		return true
+	default:
+		return false
 	}
 }
 
@@ -5384,6 +5421,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 		case err := <-pendingSend:
 			pendingSend = nil
+			if errors.Is(err, errTurnCancelled) {
+				// A guarded fallback-chain send found the turn stopped.
+				sp.discard()
+				outcome.Cancelled = true
+				return
+			}
 			if err != nil && intercept == interceptAnyError {
 				return interceptTurn(ErrorKindUnknown, time.Time{}, err.Error())
 			}
@@ -6926,12 +6969,30 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		state.mu.Lock()
 		as := state.agentSession // capture under lock to avoid race with cleanup (mirrors #1436)
 		state.mu.Unlock()
-		if (as == nil || !as.Alive()) && primaryWithFallback && e.agentFallback != nil {
+		// fallbackDrain gates every agent-fallback lifecycle change in this
+		// loop; without a chain the loop is exactly the pre-chain code.
+		fallbackDrain := primaryWithFallback && e.agentFallback != nil
+		// turnLive reports whether this drain still owns the user's turn:
+		// /stop marks the state stopped and force-unlocks the session.
+		turnLive := func(st *interactiveState) bool {
+			return !st.isStopped() && session.HoldsLock(lockGen)
+		}
+		if fallbackDrain && !turnLive(state) {
+			e.send(queued.platform, queued.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "session reset"))
+			return false
+		}
+		if (as == nil || !as.Alive()) && fallbackDrain {
 			// The primary died on a retriable failure (e.g. claude exited on
 			// a 429). Start it again for this queued message instead of
 			// dropping the queue; the new state adopts the remaining queue
 			// and keeps fallback eligibility.
 			restarted := e.getOrCreateInteractiveStateWith(sessionKey, queued.platform, queued.replyCtx, session, sessions, nil, "")
+			if !turnLive(state) {
+				// /stop ran while the primary was starting: this turn is
+				// gone, and the state may belong to a newer turn.
+				e.send(queued.platform, queued.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "session reset"))
+				return false
+			}
 			restarted.mu.Lock()
 			restarted.platform = queued.platform
 			restarted.replyCtx = queued.replyCtx
@@ -6950,19 +7011,32 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 			return false
 		}
 
-		// This goroutine owns the event channel for the queued turn: stop
-		// the unsolicited reader first, or it can steal the turn's result or
-		// auto-deny its permission requests.
-		e.stopUnsolicitedReader(state)
-		e.cancelAgentSessionIdleClose(state)
+		if fallbackDrain {
+			// This goroutine must own the event channel for the queued turn:
+			// stop the unsolicited reader first, or it can steal the turn's
+			// result or auto-deny its permission requests. If the reader does
+			// not confirm its exit, fail closed for this message.
+			if !e.stopUnsolicitedReaderConfirmed(state) {
+				slog.Warn("agent fallback: unsolicited reader still running; not sending queued message",
+					"session", sessionKey)
+				e.send(queued.platform, queued.replyCtx, e.i18n.T(MsgPreviousProcessing))
+				continue
+			}
+			e.cancelAgentSessionIdleClose(state)
+		}
 		drainEvents(as.Events())
 
 		session.AddHistory("user", queued.content)
 
 		sendDone := make(chan error, 1)
+		sendState := state
 		go func() {
 			if as == nil {
 				sendDone <- fmt.Errorf("agent session became nil")
+				return
+			}
+			if fallbackDrain && !turnLive(sendState) {
+				sendDone <- errTurnCancelled
 				return
 			}
 			sendDone <- as.Send(prompt, queued.messageID, queued.images, queued.files)
@@ -6978,7 +7052,9 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 			guard := fallbackGuard{primary: state, session: session, sessions: sessions, lockGen: lockGen, interactiveKey: sessionKey}
 			e.answerWithFallbacks(guard, outcome)
 		}
-		e.restartUnsolicitedReaderAfterQueuedTurn(state, session, sessions, sessionKey)
+		if fallbackDrain {
+			e.restartUnsolicitedReaderAfterQueuedTurn(state, session, sessions, sessionKey)
+		}
 	}
 }
 

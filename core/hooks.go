@@ -82,6 +82,20 @@ type HookManager struct {
 	shellProfile string // prepended to every command
 	mu          sync.RWMutex
 	client      *http.Client
+
+	// eventMapper, when set (agent fallback chain only), rewrites an event
+	// or drops it (false) before dispatch. nil = events pass unchanged.
+	eventMapper func(HookEvent) (HookEvent, bool)
+}
+
+// setEventMapper installs or clears the event mapper. Safe on a nil manager.
+func (hm *HookManager) setEventMapper(fn func(HookEvent) (HookEvent, bool)) {
+	if hm == nil {
+		return
+	}
+	hm.mu.Lock()
+	hm.eventMapper = fn
+	hm.mu.Unlock()
 }
 
 // NewHookManager creates a manager for the given project name.
@@ -132,14 +146,14 @@ func (hm *HookManager) Emit(event HookEvent) {
 		return
 	}
 	event.Project = hm.project
-	// Agent fallback states run under internal keys ("chat#fallback:0");
-	// hooks see the user's conversation key. Their session start/end is an
-	// implementation detail of one turn, not a conversation lifecycle event.
-	if isFallbackStateKey(event.SessionKey) {
-		if event.Event == HookEventSessionStarted || event.Event == HookEventSessionEnded {
+	hm.mu.RLock()
+	mapper := hm.eventMapper
+	hm.mu.RUnlock()
+	if mapper != nil {
+		var keep bool
+		if event, keep = mapper(event); !keep {
 			return
 		}
-		event.SessionKey = externalSessionKey(event.SessionKey)
 	}
 	if event.Timestamp.IsZero() {
 		event.Timestamp = time.Now()

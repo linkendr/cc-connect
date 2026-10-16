@@ -1,6 +1,7 @@
 package core
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -163,6 +164,8 @@ type agentFallbackChain struct {
 	// Timestamp of the newest primary history entry the fallback agent has
 	// seen (History timestamps, not c.now, so the clocks always match).
 	handedOff map[string]fallbackWatermark
+	// owned maps each fallback state key to its conversation key.
+	owned map[string]string
 
 	blockedUntil time.Time
 	blockedKind  ErrorKind
@@ -189,6 +192,7 @@ func newAgentFallbackChain(specs []AgentFallbackSpec) *agentFallbackChain {
 		agents:    make([]Agent, len(specs)),
 		sessions:  make([]*SessionManager, len(specs)),
 		handedOff: make(map[string]fallbackWatermark),
+		owned:     make(map[string]string),
 	}
 }
 
@@ -197,28 +201,75 @@ func newAgentFallbackChain(specs []AgentFallbackSpec) *agentFallbackChain {
 func (e *Engine) SetAgentFallbacks(specs []AgentFallbackSpec) {
 	if len(specs) == 0 {
 		e.agentFallback = nil
+		e.hooks.setEventMapper(nil)
 		return
 	}
 	e.agentFallback = newAgentFallbackChain(specs)
+	e.hooks.setEventMapper(e.agentFallback.hookKeyMapper)
 }
 
 func fallbackStateKey(interactiveKey string, i int) string {
 	return fmt.Sprintf("%s#fallback:%d", interactiveKey, i)
 }
 
-func isFallbackStateKey(key string) bool {
-	return strings.Contains(key, "#fallback:")
+// registerState records fbKey as a fallback state owned by the chain, for
+// the conversation interactiveKey. Fallback states are identified only
+// through this registry, never by the shape of the key: platforms such as
+// cloud-web accept arbitrary external session keys, which may contain
+// "#fallback:".
+func (c *agentFallbackChain) registerState(fbKey, interactiveKey string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.owned[fbKey] = interactiveKey
 }
 
-// externalSessionKey maps an internal fallback state key back to the user's
-// conversation key ("chat#fallback:0" → "chat"). Hooks and other external
-// consumers only ever see the conversation key.
-func externalSessionKey(key string) string {
-	if i := strings.Index(key, "#fallback:"); i >= 0 {
-		return key[:i]
+// ownerOf returns the conversation key of a registered fallback state.
+func (c *agentFallbackChain) ownerOf(key string) (string, bool) {
+	if c == nil {
+		return "", false
 	}
-	return key
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	owner, ok := c.owned[key]
+	return owner, ok
 }
+
+// ownedStatesOf lists the registered fallback state keys of a conversation.
+func (c *agentFallbackChain) ownedStatesOf(interactiveKey string) []string {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var keys []string
+	for k, owner := range c.owned {
+		if owner == interactiveKey {
+			keys = append(keys, k)
+		}
+	}
+	return keys
+}
+
+// hookKeyMapper is installed on the project's HookManager when a chain is
+// configured: hooks see the conversation key instead of a fallback state
+// key, and fallback-state session start/end (one turn's implementation
+// detail) is not reported. Without a chain no mapper is installed and hooks
+// are untouched.
+func (c *agentFallbackChain) hookKeyMapper(ev HookEvent) (HookEvent, bool) {
+	owner, ok := c.ownerOf(ev.SessionKey)
+	if !ok {
+		return ev, true
+	}
+	if ev.Event == HookEventSessionStarted || ev.Event == HookEventSessionEnded {
+		return ev, false
+	}
+	ev.SessionKey = owner
+	return ev, true
+}
+
+// errTurnCancelled is reported on sendDone when a guarded send finds its
+// turn already stopped; processInteractiveEvents ends the turn silently.
+var errTurnCancelled = errors.New("turn cancelled before send")
 
 // agentAt returns fallback agent i and its session manager, building them on
 // first use. A build error is returned every time (no caching), so a missing
@@ -284,16 +335,22 @@ func agentDisplayName(a Agent) string {
 // primaryBlocked reports whether the primary is inside a known limit window.
 func (c *agentFallbackChain) primaryBlocked() (time.Time, ErrorKind, bool) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.blockedUntil.IsZero() {
+	until, kind := c.blockedUntil, c.blockedKind
+	c.mu.Unlock()
+	if until.IsZero() {
 		return time.Time{}, ErrorKindUnknown, false
 	}
-	if !c.now().Before(c.blockedUntil) {
-		c.blockedUntil = time.Time{}
-		c.blockedKind = ErrorKindUnknown
+	// c.now is called without c.mu held (it is injectable).
+	if !c.now().Before(until) {
+		c.mu.Lock()
+		if c.blockedUntil.Equal(until) {
+			c.blockedUntil = time.Time{}
+			c.blockedKind = ErrorKindUnknown
+		}
+		c.mu.Unlock()
 		return time.Time{}, ErrorKindUnknown, false
 	}
-	return c.blockedUntil, c.blockedKind, true
+	return until, kind, true
 }
 
 // recordPrimaryFailure remembers the primary's reset time, if it gave one.
@@ -301,9 +358,9 @@ func (c *agentFallbackChain) recordPrimaryFailure(kind ErrorKind, resetAt time.T
 	if resetAt.IsZero() || kind == ErrorKindOverloaded {
 		return
 	}
+	now := c.now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	now := c.now()
 	if !resetAt.After(now) {
 		return
 	}
@@ -404,13 +461,16 @@ func (e *Engine) runFallbackTurn(guard fallbackGuard, i int, agent Agent, fbSess
 		ccKey = interactiveKey
 	}
 	if guard.cancelled(e) {
+		slog.Info("agent fallback: turn cancelled", "session_key", interactiveKey, "index", i, "stage", "before_state")
 		return turnOutcome{Cancelled: true}
 	}
+	chain.registerState(fbKey, interactiveKey)
 	state := e.getOrCreateInteractiveStateWith(fbKey, in.platform, in.replyCtx, fbSession, fbSessions, agent, ccKey)
 	// Re-check now that the state is registered: a /stop that ran before
 	// registration could not see it (stopFallbackStates found nothing), but
 	// it marked the primary stopped / bumped the lock generation first.
 	if guard.cancelled(e) {
+		slog.Info("agent fallback: turn cancelled", "session_key", interactiveKey, "index", i, "stage", "after_state")
 		e.cleanupInteractiveState(fbKey, state)
 		return turnOutcome{Cancelled: true}
 	}
@@ -441,16 +501,22 @@ func (e *Engine) runFallbackTurn(guard fallbackGuard, i int, agent Agent, fbSess
 	fbSession.AddHistory("user", in.content)
 	histBefore := fbSession.HistoryLen()
 
-	if guard.cancelled(e) || state.isStopped() {
-		e.cleanupInteractiveState(fbKey, state)
-		return turnOutcome{Cancelled: true}
-	}
 	var stopTyping func()
 	if ti, ok := in.platform.(TypingIndicator); ok {
 		stopTyping = ti.StartTyping(e.ctx, in.replyCtx)
 	}
 	sendDone := make(chan error, 1)
 	go func() {
+		// The last check is inside the send path itself, right before
+		// Send: a /stop that completed after the checks above (while
+		// StartTyping blocked, or before this goroutine ran) has marked the
+		// primary and this state stopped and released the busy lock by now.
+		// processInteractiveEvents then ends the turn silently.
+		if guard.cancelled(e) || state.isStopped() {
+			slog.Info("agent fallback: turn cancelled", "session_key", interactiveKey, "index", i, "stage", "send")
+			sendDone <- errTurnCancelled
+			return
+		}
 		sendDone <- as.Send(prompt, in.messageID, in.images, in.files)
 	}()
 	out := e.processInteractiveEvents(state, fbSession, fbSessions, fbKey, in.messageID, time.Now(), stopTyping, sendDone, in.replyCtx, 0)
@@ -543,22 +609,21 @@ func (c *agentFallbackChain) historyPrefix(fbKey string, session *Session, fbSes
 // stopFallbackStates stops fallback turns that belong to interactiveKey, so
 // /stop also halts a fallback agent that is answering for it.
 func (e *Engine) stopFallbackStates(interactiveKey string, notifyQueued bool) {
-	if e.agentFallback == nil || isFallbackStateKey(interactiveKey) {
+	if e.agentFallback == nil {
 		return
 	}
-	for i := range e.agentFallback.specs {
-		e.stopInteractiveSessionWithOptions(fallbackStateKey(interactiveKey, i), notifyQueued)
+	for _, key := range e.agentFallback.ownedStatesOf(interactiveKey) {
+		e.stopInteractiveSessionWithOptions(key, notifyQueued)
 	}
 }
 
 // cleanupFallbackStates closes fallback agent sessions that belong to
 // interactiveKey (session reset, cron run end, idle reap of the primary).
 func (e *Engine) cleanupFallbackStates(interactiveKey string) {
-	if e.agentFallback == nil || isFallbackStateKey(interactiveKey) {
+	if e.agentFallback == nil {
 		return
 	}
-	for i := range e.agentFallback.specs {
-		key := fallbackStateKey(interactiveKey, i)
+	for _, key := range e.agentFallback.ownedStatesOf(interactiveKey) {
 		e.interactiveMu.Lock()
 		_, ok := e.interactiveStates[key]
 		e.interactiveMu.Unlock()

@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -137,6 +139,7 @@ type scriptedAgent struct {
 	display string
 	session *scriptedSession
 	more    []*scriptedSession
+	onStart func() // runs inside StartSession, unlocked
 	mu      sync.Mutex
 	starts  int
 }
@@ -144,6 +147,12 @@ type scriptedAgent struct {
 func (a *scriptedAgent) Name() string        { return a.name }
 func (a *scriptedAgent) DisplayName() string { return a.display }
 func (a *scriptedAgent) StartSession(_ context.Context, _ string) (AgentSession, error) {
+	a.mu.Lock()
+	hook := a.onStart
+	a.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.starts++
@@ -167,8 +176,10 @@ func (a *scriptedAgent) StartCount() int {
 // engine sends (e.g. issue /stop right after the fallback notice).
 type hookPlatform struct {
 	stubPlatformEngine
-	hookMu sync.Mutex
-	onSend func(content string)
+	hookMu       sync.Mutex
+	onSend       func(content string)
+	onTyping     func()
+	onTypingStop func()
 }
 
 func (h *hookPlatform) Send(ctx context.Context, rc any, content string) error {
@@ -184,6 +195,31 @@ func (h *hookPlatform) Send(ctx context.Context, rc any, content string) error {
 
 func (h *hookPlatform) Reply(ctx context.Context, rc any, content string) error {
 	return h.Send(ctx, rc, content)
+}
+
+// StartTyping makes hookPlatform a TypingIndicator; onTyping (optional) runs
+// inside StartTyping, and the returned stop func runs onTypingStop.
+func (h *hookPlatform) StartTyping(_ context.Context, _ any) func() {
+	h.hookMu.Lock()
+	start, stop := h.onTyping, h.onTypingStop
+	h.hookMu.Unlock()
+	if start != nil {
+		start()
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			if stop != nil {
+				stop()
+			}
+		})
+	}
+}
+
+func (h *hookPlatform) setTypingHooks(start, stop func()) {
+	h.hookMu.Lock()
+	h.onTyping, h.onTypingStop = start, stop
+	h.hookMu.Unlock()
 }
 
 type fallbackEnv struct {
@@ -751,13 +787,14 @@ func TestAgentFallback_StopAfterNoticeCancelsFallback(t *testing.T) {
 	env.fbs[0].session.beforeTurn = func(int) { close(sent) }
 	env.fbs[0].session.mu.Unlock()
 
+	cancelled := watchLog(t, "agent fallback: turn cancelled")
 	env.receive("question")
 	waitClosed(t, stopped, "/stop after notice")
-	// Negative check: give the turn goroutine time to (wrongly) send.
+	waitClosed(t, cancelled, "fallback cancellation")
 	select {
 	case <-sent:
 		t.Fatal("fallback agent was sent the stopped message")
-	case <-time.After(300 * time.Millisecond):
+	default:
 	}
 	env.e.interactiveMu.Lock()
 	_, registered := env.e.interactiveStates[fallbackStateKey(fallbackTestKey, 0)]
@@ -887,17 +924,317 @@ func TestAgentFallback_HooksSeeConversationKey(t *testing.T) {
 	}
 }
 
-func TestExternalSessionKey(t *testing.T) {
-	cases := map[string]string{
-		"discord:chan:thread":                    "discord:chan:thread",
-		"discord:chan:thread#fallback:0":         "discord:chan:thread",
-		"tg:1:1#cron:abc#fallback:2":             "tg:1:1#cron:abc",
-		fallbackStateKey("ws:/repo:slack:C1", 1): "ws:/repo:slack:C1",
-		"":                                       "",
+// ---------- review round 2 ----------
+
+// logWatcher is a slog handler that closes ch on the first record whose
+// message contains substr; other records go to the previous handler.
+type logWatcher struct {
+	next   slog.Handler
+	substr string
+	once   *sync.Once
+	ch     chan struct{}
+}
+
+func (w logWatcher) Enabled(ctx context.Context, l slog.Level) bool { return true }
+func (w logWatcher) Handle(ctx context.Context, r slog.Record) error {
+	if strings.Contains(r.Message, w.substr) {
+		w.once.Do(func() { close(w.ch) })
 	}
-	for in, want := range cases {
-		if got := externalSessionKey(in); got != want {
-			t.Errorf("externalSessionKey(%q) = %q, want %q", in, got, want)
+	if w.next.Enabled(ctx, r.Level) {
+		return w.next.Handle(ctx, r)
+	}
+	return nil
+}
+func (w logWatcher) WithAttrs(a []slog.Attr) slog.Handler {
+	w.next = w.next.WithAttrs(a)
+	return w
+}
+func (w logWatcher) WithGroup(n string) slog.Handler {
+	w.next = w.next.WithGroup(n)
+	return w
+}
+
+// watchLog returns a channel closed when the engine logs a message
+// containing substr: a deterministic "this code path ran" signal.
+func watchLog(t *testing.T, substr string) <-chan struct{} {
+	t.Helper()
+	prev := slog.Default()
+	ch := make(chan struct{})
+	// Not prev.Handler(): the default handler writes through package log,
+	// which SetDefault redirects back into slog (recursion).
+	next := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})
+	slog.SetDefault(slog.New(logWatcher{next: next, substr: substr, once: &sync.Once{}, ch: ch}))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return ch
+}
+
+// drainFixture builds a primary interactive state with one queued message,
+// as the engine has it when drainPendingMessages starts, and locks the
+// session for the turn.
+func (env *fallbackEnv) drainFixture(primary *scriptedSession, withFallbackPolicy bool) (*interactiveState, *Session, uint64) {
+	env.t.Helper()
+	session := env.e.sessions.GetOrCreateActive(fallbackTestKey)
+	gen, ok := session.TryLock()
+	if !ok {
+		env.t.Fatal("session already locked")
+	}
+	st := &interactiveState{
+		agentSession: primary,
+		busySession:  session,
+		platform:     env.p,
+		replyCtx:     "ctx",
+		agent:        env.primary,
+		pendingMessages: []queuedMessage{{
+			messageID: "q1", platform: env.p, replyCtx: "ctx", content: "queued question",
+			userID: "u1", userName: "user", msgPlatform: "test", msgSessionKey: fallbackTestKey,
+		}},
+	}
+	if withFallbackPolicy {
+		st.fallbackIntercept = interceptRetriable
+	}
+	env.e.interactiveMu.Lock()
+	env.e.interactiveStates[fallbackTestKey] = st
+	env.e.interactiveMu.Unlock()
+	return st, session, gen
+}
+
+// R2-1a: /stop between popping a queued message and restarting the dead
+// primary: no restart, no send, the message is dropped as stopped.
+func TestAgentFallback_StopBeforeDeadPrimaryRestart(t *testing.T) {
+	env := newFallbackEnv(t, nil, []scriptedTurn{okTurn("unused")})
+	dead := newScriptedSession("dead-sid")
+	dead.dead = true
+	fresh := newScriptedSession("fresh-sid", okTurn("must not run"))
+	env.primary.session = dead
+	env.primary.more = []*scriptedSession{fresh}
+	env.primary.starts = 1 // the dead primary was started once already
+	st, session, gen := env.drainFixture(dead, true)
+
+	// primaryBlocked runs between the pop and the restart; an expired block
+	// makes it consult the clock, where the test issues /stop.
+	env.e.agentFallback.mu.Lock()
+	env.e.agentFallback.blockedUntil = env.now.Add(-time.Minute)
+	env.e.agentFallback.mu.Unlock()
+	var once sync.Once
+	env.e.agentFallback.now = func() time.Time {
+		once.Do(func() { env.e.stopInteractiveSession(fallbackTestKey, env.p, "ctx") })
+		return env.now
+	}
+
+	env.e.drainPendingMessages(st, session, env.e.sessions, fallbackTestKey, gen)
+
+	if got := env.primary.StartCount(); got != 1 {
+		t.Errorf("primary starts = %d, want 1 (no restart after /stop)", got)
+	}
+	if got := fresh.prompts(); len(got) != 0 {
+		t.Errorf("stopped queued message was sent: %q", got)
+	}
+	if env.sentContaining("session reset") != 1 {
+		t.Errorf("stopped queued message not reported; sent = %#v", env.p.getSent())
+	}
+}
+
+// R2-1b: /stop lands while the dead primary is being restarted: the restart
+// may happen, but the stopped message is never sent. StartSession runs under
+// interactiveMu, so the hook applies /stop's effect on the turn directly
+// (state stopped, busy lock force-released) instead of calling /stop.
+func TestAgentFallback_StopDuringDeadPrimaryRestart(t *testing.T) {
+	env := newFallbackEnv(t, nil, []scriptedTurn{okTurn("unused")})
+	dead := newScriptedSession("dead-sid")
+	dead.dead = true
+	fresh := newScriptedSession("fresh-sid", okTurn("must not run"))
+	env.primary.session = dead
+	env.primary.more = []*scriptedSession{fresh}
+	st, session, gen := env.drainFixture(dead, true)
+	env.primary.onStart = func() {
+		st.markStopped()
+		session.ForceUnlock()
+	}
+
+	env.e.drainPendingMessages(st, session, env.e.sessions, fallbackTestKey, gen)
+
+	if got := fresh.prompts(); len(got) != 0 {
+		t.Errorf("stopped queued message was sent: %q", got)
+	}
+	if env.sentContaining("session reset") != 1 {
+		t.Errorf("stopped queued message not reported; sent = %#v", env.p.getSent())
+	}
+}
+
+// R2-2: /stop completes while the last fallback is inside StartTyping (after
+// every earlier check passed): the send path itself refuses to send.
+func TestAgentFallback_StopDuringFallbackTypingPreventsSend(t *testing.T) {
+	env := newFallbackEnv(t,
+		[]scriptedTurn{usageLimitTurn(time.Time{})},
+		[]scriptedTurn{okTurn("must not run")},
+	)
+	var noticeSeen sync.Once
+	armed := make(chan struct{})
+	env.p.hookMu.Lock()
+	env.p.onSend = func(c string) {
+		if strings.Contains(c, "answering with") {
+			noticeSeen.Do(func() { close(armed) })
 		}
+	}
+	env.p.hookMu.Unlock()
+	inTyping, release, turnEnded := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var typingOnce, endOnce sync.Once
+	env.p.setTypingHooks(func() {
+		select {
+		case <-armed: // only the fallback's typing indicator blocks
+			typingOnce.Do(func() { close(inTyping); <-release })
+		default:
+		}
+	}, func() {
+		select {
+		case <-armed:
+			select {
+			case <-inTyping:
+				endOnce.Do(func() { close(turnEnded) })
+			default:
+			}
+		default:
+		}
+	})
+	sent := make(chan struct{})
+	env.fbs[0].session.mu.Lock()
+	env.fbs[0].session.beforeTurn = func(int) { close(sent) }
+	env.fbs[0].session.mu.Unlock()
+
+	// Exactly one of these happens once the send goroutine runs: the
+	// guarded send logs its cancellation, or the agent receives Send.
+	cancelled := watchLog(t, "agent fallback: turn cancelled")
+	env.receive("question")
+	waitClosed(t, inTyping, "fallback StartTyping")
+	if !env.e.stopInteractiveSession(fallbackTestKey, env.p, "ctx") {
+		t.Fatal("/stop found no session")
+	}
+	close(release)
+	select {
+	case <-sent:
+		t.Fatal("fallback agent was sent the message after /stop")
+	case <-cancelled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("send path neither sent nor cancelled")
+	}
+	waitClosed(t, turnEnded, "fallback turn end")
+}
+
+// R2-3: the unsolicited reader is stuck in a slow platform send past the
+// stop timeout: the queued message is not sent (fail closed) and the user
+// gets the "previous request still processing" notice.
+func TestAgentFallback_StuckUnsolicitedReaderFailsClosed(t *testing.T) {
+	old := unsolicitedReaderStopTimeout
+	unsolicitedReaderStopTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { unsolicitedReaderStopTimeout = old })
+
+	env := newFallbackEnv(t, nil, []scriptedTurn{okTurn("unused")})
+	primary := newScriptedSession("primary-sid", okTurn("must not run"))
+	env.primary.session = primary
+	st, session, gen := env.drainFixture(primary, true)
+
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	env.p.hookMu.Lock()
+	env.p.onSend = func(c string) {
+		if strings.Contains(c, "background result") {
+			once.Do(func() { close(entered); <-release })
+		}
+	}
+	env.p.hookMu.Unlock()
+	e := env.e
+	e.startUnsolicitedReader(st, session, e.sessions, fallbackTestKey, "")
+	primary.events <- Event{Type: EventResult, Content: "background result", Done: true}
+	waitClosed(t, entered, "unsolicited reader blocked in platform send")
+
+	e.drainPendingMessages(st, session, e.sessions, fallbackTestKey, gen)
+	close(release)
+
+	if got := primary.prompts(); len(got) != 0 {
+		t.Errorf("queued message sent while the reader still owned Events(): %q", got)
+	}
+	if env.sentContaining("Previous request still processing") != 1 {
+		t.Errorf("no fail-closed notice; sent = %#v", env.p.getSent())
+	}
+}
+
+// R2-5: hooks keep keys that merely look like fallback state keys, with or
+// without a chain; only registered fallback states are mapped.
+func TestAgentFallback_HookKeysUseRegistryNotSubstring(t *testing.T) {
+	var mu sync.Mutex
+	var got []HookEvent
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var ev HookEvent
+		_ = json.NewDecoder(r.Body).Decode(&ev)
+		mu.Lock()
+		got = append(got, ev)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	async := false
+	newHM := func() *HookManager {
+		return NewHookManager("test", []HookConfig{{Event: "*", Type: "http", URL: srv.URL, Async: &async}}, "sh", "-c", "")
+	}
+	const external = "custom:room#fallback:0"
+
+	// Empty chain: no mapper at all.
+	plain := newFallbackEnv(t, nil)
+	plain.e.SetHooks(newHM())
+	plain.e.hooks.Emit(HookEvent{Event: HookEventSessionStarted, SessionKey: external})
+	plain.e.hooks.Emit(HookEvent{Event: HookEventMessageSent, SessionKey: external})
+
+	// Chain configured: an unregistered look-alike key also passes unchanged,
+	// a registered fallback state key is mapped.
+	chained := newFallbackEnv(t, nil, []scriptedTurn{okTurn("x")})
+	chained.e.SetHooks(newHM())
+	chained.e.hooks.Emit(HookEvent{Event: HookEventSessionStarted, SessionKey: external})
+	chained.e.agentFallback.registerState(fallbackStateKey("chat", 0), "chat")
+	chained.e.hooks.Emit(HookEvent{Event: HookEventMessageSent, SessionKey: fallbackStateKey("chat", 0)})
+	chained.e.hooks.Emit(HookEvent{Event: HookEventSessionEnded, SessionKey: fallbackStateKey("chat", 0)})
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := []struct {
+		ev  HookEventType
+		key string
+	}{
+		{HookEventSessionStarted, external},
+		{HookEventMessageSent, external},
+		{HookEventSessionStarted, external},
+		{HookEventMessageSent, "chat"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d hook calls, want %d: %+v", len(got), len(want), got)
+	}
+	for i, w := range want {
+		if got[i].Event != w.ev || got[i].SessionKey != w.key {
+			t.Errorf("hook %d = (%s, %q), want (%s, %q)", i, got[i].Event, got[i].SessionKey, w.ev, w.key)
+		}
+	}
+}
+
+// R2-6: with no fallback chain, draining a queued message behaves as on
+// main: no unsolicited reader is started and no idle close is armed by the
+// drain loop.
+func TestAgentFallback_EmptyChainDrainKeepsLifecycle(t *testing.T) {
+	env := newFallbackEnv(t, nil)
+	env.e.SetAgentSessionIdleTimeout(time.Hour)
+	primary := newScriptedSession("primary-sid", okTurn("queued answer"))
+	env.primary.session = primary
+	st, session, gen := env.drainFixture(primary, false)
+
+	if !env.e.drainPendingMessages(st, session, env.e.sessions, fallbackTestKey, gen) {
+		t.Fatal("drain did not unlock the session")
+	}
+	env.waitSent("queued answer")
+	st.mu.Lock()
+	reader, idle := st.unsolicitedCancel != nil, st.agentSessionIdleCancel != nil
+	st.mu.Unlock()
+	if reader {
+		t.Error("drain started an unsolicited reader without a fallback chain")
+	}
+	if idle {
+		t.Error("drain armed the idle close without a fallback chain")
 	}
 }
