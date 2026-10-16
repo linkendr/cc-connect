@@ -718,20 +718,20 @@ func (e *Engine) runFallbackTurn(guard fallbackGuard, i int, agent Agent, fbSess
 
 	state.mu.Lock()
 	state.fallbackIntercept = interceptNone
-	alive := state.agentSession != nil && state.agentSession.Alive() && !state.stopped
 	state.mu.Unlock()
-	if out.Intercepted || out.Failed {
-		// Retire a fallback session whose turn ended in an error: its
-		// process may still emit events (e.g. a late completion after the
-		// error) that the next turn would take as its own. Close it (kills
-		// the process, waits for its read loop) and remove the state, while
-		// this turn still holds the fallback busy lock; the next turn starts
-		// a fresh agent session. Only fallback states are retired; the
-		// primary's session reuse is unchanged.
-		e.cleanupInteractiveState(fbKey, state)
-	} else if alive {
-		e.scheduleAgentSessionIdleClose(fbKey, state)
-	}
+	// Retire the fallback session after every turn, success or failure.
+	// `opencode run` is one process per turn, and a finished turn's process
+	// or read loop can still emit events (a late completion after the
+	// answer or after an error) that the next turn would take as its own.
+	// Close it (kills the process, waits for the read loop within the
+	// adapter's bound) and remove the state while this turn still holds the
+	// fallback busy lock. The next turn starts a fresh session object and
+	// process, resuming the same conversation ID from the fallback Session.
+	// If the close fails or times out, closeAgentSession marks the key
+	// unsafe to resume, so the next turn also starts a fresh conversation:
+	// a retired session is never reused. Only fallback states are retired;
+	// the primary's session lifecycle is unchanged.
+	e.cleanupInteractiveState(fbKey, state)
 
 	if out.Intercepted {
 		slog.Warn("agent fallback: fallback agent failed", "index", i, "kind", out.Kind, "error", out.ErrText)

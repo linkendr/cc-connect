@@ -759,6 +759,15 @@ type pendingPermission struct {
 	CurrentQuestion int            // index of the question currently being asked
 	Resolved        chan struct{}  // closed when user responds
 	resolveOnce     sync.Once
+	// claimed is taken (CAS) by the one path that answers the request when
+	// an agent fallback chain is configured: the user's reply, engine Stop,
+	// or the shutdown branch of the wait. The loser does not answer.
+	claimed atomic.Bool
+}
+
+// claim reports whether the caller won the right to answer the request.
+func (pp *pendingPermission) claim() bool {
+	return pp.claimed.CompareAndSwap(false, true)
 }
 
 func (s *interactiveState) stopSignal() <-chan struct{} {
@@ -2473,7 +2482,7 @@ func (e *Engine) Stop() error {
 			if pending == nil {
 				continue
 			}
-			if as != nil {
+			if pending.claim() && as != nil {
 				if err := as.RespondPermission(pending.RequestID, PermissionResult{Behavior: "deny", Message: "cc-connect is shutting down"}); err != nil {
 					slog.Debug("engine.Stop: deny pending permission", "session", key, "error", err)
 				}
@@ -3711,6 +3720,9 @@ found:
 		}
 
 		// All questions answered — build response and resolve
+		if e.agentFallback != nil && !pending.claim() {
+			return true // already answered (shutdown)
+		}
 		updatedInput := buildAskQuestionResponse(pending.ToolInput, pending.Questions, pending.Answers)
 
 		if err := state.agentSession.RespondPermission(pending.RequestID, PermissionResult{
@@ -3732,6 +3744,9 @@ found:
 
 	lower := strings.ToLower(strings.TrimSpace(content))
 
+	if e.agentFallback != nil && (isApproveAllResponse(lower) || isAllowResponse(lower) || isDenyResponse(lower)) && !pending.claim() {
+		return true // already answered (shutdown)
+	}
 	if isApproveAllResponse(lower) {
 		state.mu.Lock()
 		state.approveAll = true
@@ -6137,7 +6152,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					}
 					as := state.agentSession
 					state.mu.Unlock()
-					if owned && as != nil {
+					if owned && pending.claim() && as != nil {
 						_ = as.RespondPermission(pending.RequestID, PermissionResult{Behavior: "deny", Message: "cc-connect is shutting down"})
 					}
 					pending.resolve()

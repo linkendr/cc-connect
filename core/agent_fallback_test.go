@@ -59,6 +59,7 @@ type scriptedSession struct {
 	onAllow    scriptedTurn       // emitted when a permission is allowed
 	perms      []PermissionResult // RespondPermission calls
 	aliveCalls atomic.Int32       // Alive() call count
+	closeErr   error              // returned by Close (e.g. read loop did not exit)
 }
 
 func newScriptedSession(id string, turns ...scriptedTurn) *scriptedSession {
@@ -117,6 +118,28 @@ func (s *scriptedSession) permissions() []PermissionResult {
 	return append([]PermissionResult(nil), s.perms...)
 }
 
+// Events reads the channel under the session mutex (reopen replaces it).
+func (s *scriptedSession) Events() <-chan Event {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.events
+}
+
+// reopen models a fresh agent session object for the same script (the
+// engine retires fallback sessions after every turn): the remaining turns
+// continue on a new event channel.
+func (s *scriptedSession) reopen() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.closed {
+		return
+	}
+	s.closed = false
+	s.dead = false
+	s.events = make(chan Event, 16)
+	s.controllableAgentSession.closed = make(chan struct{})
+}
+
 func (s *scriptedSession) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -124,7 +147,8 @@ func (s *scriptedSession) Close() error {
 		return nil
 	}
 	s.closed = true
-	return s.queuingAgentSession.Close()
+	_ = s.queuingAgentSession.Close()
+	return s.closeErr
 }
 
 // Alive reads the mutex-guarded flag; the embedded stub's plain bool would
@@ -145,18 +169,19 @@ func (s *scriptedSession) prompts() []string {
 // scriptedAgent hands out its scripted session; after a restart it hands
 // out the next one from more (the last one is reused).
 type scriptedAgent struct {
-	name    string
-	display string
-	session *scriptedSession
-	more    []*scriptedSession
-	onStart func() // runs inside StartSession, unlocked
-	mu      sync.Mutex
-	starts  int
+	name     string
+	display  string
+	session  *scriptedSession
+	more     []*scriptedSession
+	onStart  func() // runs inside StartSession, unlocked
+	mu       sync.Mutex
+	starts   int
+	startIDs []string // resume IDs passed to StartSession
 }
 
 func (a *scriptedAgent) Name() string        { return a.name }
 func (a *scriptedAgent) DisplayName() string { return a.display }
-func (a *scriptedAgent) StartSession(_ context.Context, _ string) (AgentSession, error) {
+func (a *scriptedAgent) StartSession(_ context.Context, sessionID string) (AgentSession, error) {
 	a.mu.Lock()
 	hook := a.onStart
 	a.mu.Unlock()
@@ -169,7 +194,10 @@ func (a *scriptedAgent) StartSession(_ context.Context, _ string) (AgentSession,
 	if a.starts > 1 && len(a.more) > 0 {
 		a.session = a.more[0]
 		a.more = a.more[1:]
+	} else {
+		a.session.reopen()
 	}
+	a.startIDs = append(a.startIDs, sessionID)
 	return a.session, nil
 }
 func (a *scriptedAgent) ListSessions(_ context.Context) ([]AgentSessionInfo, error) { return nil, nil }
@@ -1483,32 +1511,42 @@ func TestAgentFallback_RegistryForgetsRemovedStates(t *testing.T) {
 	defer srv.Close()
 
 	env := newFallbackEnv(t,
-		[]scriptedTurn{usageLimitTurn(time.Time{})},
+		[]scriptedTurn{usageLimitTurn(time.Time{}), usageLimitTurn(time.Time{})},
 		[]scriptedTurn{okTurn("fallback one")},
 	)
-	// cleanupInteractiveState closes both sessions; the second message gets
-	// fresh ones.
-	env.primary.more = []*scriptedSession{newScriptedSession("primary-sid-2", usageLimitTurn(time.Time{}))}
+	// The fallback session is retired after each turn; the second turn
+	// gets a fresh one.
 	env.fbs[0].more = []*scriptedSession{newScriptedSession("fb0-sid-2", okTurn("fallback two"))}
 	async := false
 	env.e.SetHooks(NewHookManager("test", []HookConfig{{Event: "message.sent", Type: "http", URL: srv.URL, Async: &async}}, "sh", "-c", ""))
 	fbKey := fallbackStateKey(fallbackTestKey, 0)
 
-	// Cleanup path.
+	// Cleanup path: the fallback state is retired (cleaned up) at the end
+	// of its turn; the registry must forget it with it.
+	inTurn := make(chan bool, 1)
+	env.fbs[0].session.beforeTurn = func(int) {
+		_, ok := env.e.agentFallback.ownerOf(fbKey)
+		inTurn <- ok
+	}
 	env.send("one")
 	env.waitSent("fallback one")
-	if _, ok := env.e.agentFallback.ownerOf(fbKey); !ok {
-		t.Fatal("fallback state not registered after its turn")
+	if !<-inTurn {
+		t.Fatal("fallback state not registered during its turn")
 	}
-	env.e.cleanupInteractiveState(fallbackTestKey)
 	if _, ok := env.e.agentFallback.ownerOf(fbKey); ok {
 		t.Error("registry kept a cleaned-up fallback state")
 	}
 
-	// /stop path.
-	env.send("two")
-	env.waitSent("fallback two")
+	// /stop path: stop while the fallback answers (its Send is in flight,
+	// so /stop waits out the dispatch bound; keep that short).
+	oldWait := stopDispatchWait
+	stopDispatchWait = 50 * time.Millisecond
+	t.Cleanup(func() { stopDispatchWait = oldWait })
+	entered, release := gate(env.fbs[0].more[0], 0)
+	env.receive("two")
+	waitClosed(t, entered, "second fallback turn")
 	env.e.stopInteractiveSession(fallbackTestKey, env.p, "ctx")
+	close(release)
 	if _, ok := env.e.agentFallback.ownerOf(fbKey); ok {
 		t.Error("registry kept a stopped fallback state")
 	}
@@ -1989,5 +2027,91 @@ func TestAgentFallback_SilentCrashErrorAdvances(t *testing.T) {
 	env.waitSent("second fallback answer")
 	if env.sentContaining("exited without output") != 0 {
 		t.Errorf("crash shown instead of advancing: %#v", env.p.getSent())
+	}
+}
+
+// ---------- review round 7 ----------
+
+// R7-1: a successful fallback turn retires its session too: B never takes
+// A's late completion (emitted when B sends) as its answer. The primary's
+// session is reused as before.
+func TestAgentFallback_SuccessfulFallbackSessionIsRetired(t *testing.T) {
+	env := newFallbackEnv(t,
+		[]scriptedTurn{usageLimitTurn(time.Time{}), usageLimitTurn(time.Time{})},
+		[]scriptedTurn{
+			okTurn("A answer"),
+			{{Type: EventResult, Content: "", Done: true}}, // A's late completion
+		},
+	)
+	stale := env.fbs[0].session
+	env.fbs[0].more = []*scriptedSession{newScriptedSession("fb0-fresh", okTurn("B answer"))}
+
+	env.send("A")
+	env.waitSent("A answer")
+	env.send("B")
+	env.waitSent("B answer")
+	if got := env.sentContaining("(empty response)"); got != 0 {
+		t.Errorf("B took A's late completion; sent = %#v", env.p.getSent())
+	}
+	if got := env.fbs[0].StartCount(); got != 2 {
+		t.Errorf("fallback 0 started %d sessions, want 2", got)
+	}
+	if got := len(stale.prompts()); got != 1 {
+		t.Errorf("retired fallback session reused: %d prompts", got)
+	}
+	if got := env.primary.StartCount(); got != 1 {
+		t.Errorf("primary started %d times, want 1 (primary lifecycle unchanged)", got)
+	}
+}
+
+// R7-1b: a retired fallback session whose close could not be confirmed is
+// never resumed: the next turn starts a fresh conversation.
+func TestAgentFallback_UnconfirmedCloseIsNotResumed(t *testing.T) {
+	env := newFallbackEnv(t,
+		[]scriptedTurn{usageLimitTurn(time.Time{}), usageLimitTurn(time.Time{})},
+		[]scriptedTurn{okTurn("A answer"), okTurn("B answer")},
+	)
+	env.fbs[0].session.closeErr = errors.New("read loop did not exit")
+	env.send("A")
+	env.waitSent("A answer")
+	env.send("B")
+	env.waitSent("B answer")
+	env.fbs[0].mu.Lock()
+	ids := append([]string(nil), env.fbs[0].startIDs...)
+	env.fbs[0].mu.Unlock()
+	if len(ids) != 2 || ids[1] != "" {
+		t.Errorf("start resume IDs = %q, want a fresh second start (\"\")", ids)
+	}
+}
+
+// R7-2: the user's "allow" claims the permission before answering; a
+// shutdown during the user's reply does not answer it again.
+func TestAgentFallback_PermissionAnsweredOnce(t *testing.T) {
+	env := newFallbackEnv(t,
+		[]scriptedTurn{usageLimitTurn(time.Time{})},
+		[]scriptedTurn{{{Type: EventPermissionRequest, RequestID: "p1", ToolName: "Bash", ToolInput: "ls"}}},
+	)
+	env.fbs[0].session.onAllow = okTurn("after allow")
+	fbKey := fallbackStateKey(fallbackTestKey, 0)
+	env.receive("question")
+	waitTrue(t, "fallback permission request", func() bool {
+		_, pending := env.e.lookupPending(fbKey)
+		return pending != nil
+	})
+	var once sync.Once
+	env.p.hookMu.Lock()
+	env.p.onSend = func(c string) {
+		if strings.Contains(c, "Allowed, continuing") {
+			// Between RespondPermission and the end of the user's handler.
+			once.Do(func() { _ = env.e.Stop() })
+		}
+	}
+	env.p.hookMu.Unlock()
+	resolved := watchLog(t, "permission resolved")
+	env.receive("allow")
+	waitClosed(t, resolved, "permission wait to end")
+	perms := env.fbs[0].session.permissions()
+	if len(perms) != 1 || perms[0].Behavior != "allow" {
+		t.Errorf("permission answers = %+v, want exactly one allow", perms)
 	}
 }
