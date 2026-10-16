@@ -58,6 +58,8 @@ func TestAgentFallback_Validate(t *testing.T) {
 		name         string
 		primaryModel string
 		mode         string
+		runAsUser    string
+		runAsEnv     []string
 		chain        []FallbackAgentConfig
 		wantErr      string // "" = valid
 	}{
@@ -76,6 +78,12 @@ func TestAgentFallback_Validate(t *testing.T) {
 		{name: "non-string options.model", chain: []fb{{Type: "opencode", Options: map[string]any{"model": 3}}}, wantErr: "options.model must be a string"},
 		{name: "nested fallback", chain: []fb{{Type: "opencode", Options: map[string]any{"fallback": []any{}}}}, wantErr: "do not nest"},
 		{name: "multi-workspace rejected", mode: "multi-workspace", chain: []fb{{Type: "opencode"}}, wantErr: "not supported"},
+		{name: "non-string work_dir", chain: []fb{{Type: "opencode", Options: map[string]any{"work_dir": int64(42)}}}, wantErr: "options.work_dir must be a string, got int64"},
+		{name: "non-string mode", chain: []fb{{Type: "opencode", Options: map[string]any{"mode": true}}}, wantErr: "options.mode must be a string"},
+		{name: "run_as_user project cannot fall back to opencode", runAsUser: "agent", chain: []fb{{Type: "opencode", Model: "x"}}, wantErr: `type "opencode" does not support run_as_user/run_as_env`},
+		{name: "run_as_env project cannot fall back to opencode", runAsEnv: []string{"FOO"}, chain: []fb{{Type: "opencode"}}, wantErr: "does not support run_as_user"},
+		{name: "run_as_user in fallback options for opencode", chain: []fb{{Type: "opencode", Options: map[string]any{"run_as_user": "agent"}}}, wantErr: "does not support run_as_user"},
+		{name: "run_as_user project may fall back to claudecode", runAsUser: "agent", primaryModel: "opus", chain: []fb{{Type: "claudecode", Model: "sonnet"}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -85,6 +93,8 @@ func TestAgentFallback_Validate(t *testing.T) {
 				proj.Agent.Options = map[string]any{"model": tc.primaryModel}
 			}
 			proj.Mode = tc.mode
+			proj.RunAsUser = tc.runAsUser
+			proj.RunAsEnv = tc.runAsEnv
 			proj.Agent.Fallback = tc.chain
 			err := validateAgentFallback("projects[0]", proj)
 			if tc.wantErr == "" {
@@ -108,5 +118,16 @@ func TestAgentFallback_ValidateWiredIntoLoad(t *testing.T) {
 	err := cfg.validate()
 	if err == nil || !strings.Contains(err.Error(), "projects[0].agent.fallback[0].type is required") {
 		t.Fatalf("validate() = %v, want fallback type error", err)
+	}
+}
+
+// label and model are typed string fields: a non-string value fails at decode.
+func TestAgentFallback_DecodeRejectsNonStringFields(t *testing.T) {
+	for _, entry := range []string{`{ type = "opencode", label = 42 }`, `{ type = "opencode", model = 7 }`} {
+		raw := "[[projects]]\nname = \"p\"\n[projects.agent]\ntype = \"claudecode\"\nfallback = [ " + entry + " ]\n"
+		var cfg Config
+		if _, err := toml.Decode(raw, &cfg); err == nil {
+			t.Errorf("decode of %s succeeded, want a type error", entry)
+		}
 	}
 }

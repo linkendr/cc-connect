@@ -629,6 +629,13 @@ func (f FallbackAgentConfig) EffectiveModel() string {
 	return strings.TrimSpace(m)
 }
 
+// runAsCapableAgentTypes lists the agent adapters that implement
+// run_as_user / run_as_env (spawn under another Unix user via sudo with an
+// env allowlist). Today only agent/claudecode does. A fallback of any other
+// type would silently run as the supervisor user with its full environment,
+// so a project that isolates its primary agent cannot fall back to it.
+var runAsCapableAgentTypes = map[string]bool{"claudecode": true}
+
 // validateAgentFallback checks [projects.agent].fallback: known shape, at
 // most MaxAgentFallbacks entries, no entry that is the primary agent itself
 // or repeats an earlier entry (either would loop the chain back onto an agent
@@ -645,6 +652,8 @@ func validateAgentFallback(prefix string, proj ProjectConfig) error {
 	if proj.Mode == "multi-workspace" {
 		return fmt.Errorf("config: %s.agent.fallback is not supported with mode = \"multi-workspace\"", prefix)
 	}
+	_, primaryRunAs := proj.Agent.Options["run_as_user"]
+	isolated := proj.RunAsUser != "" || len(proj.RunAsEnv) > 0 || primaryRunAs
 	type key struct{ typ, model string }
 	primaryModel, _ := proj.Agent.Options["model"].(string)
 	seen := map[key]int{{strings.TrimSpace(proj.Agent.Type), strings.TrimSpace(primaryModel)}: -1}
@@ -668,6 +677,18 @@ func validateAgentFallback(prefix string, proj ProjectConfig) error {
 		}
 		if _, ok := fb.Options["fallback"]; ok {
 			return fmt.Errorf("config: %s.options.fallback is not allowed; fallback chains do not nest", p)
+		}
+		for _, opt := range []string{"work_dir", "mode", "label"} {
+			if v, ok := fb.Options[opt]; ok {
+				if _, isStr := v.(string); !isStr {
+					return fmt.Errorf("config: %s.options.%s must be a string, got %T", p, opt, v)
+				}
+			}
+		}
+		_, ownRunAs := fb.Options["run_as_user"]
+		_, ownRunAsEnv := fb.Options["run_as_env"]
+		if (isolated || ownRunAs || ownRunAsEnv) && !runAsCapableAgentTypes[typ] {
+			return fmt.Errorf("config: %s type %q does not support run_as_user/run_as_env; it would run as the cc-connect user, outside the project's isolation", p, typ)
 		}
 		k := key{typ, fb.EffectiveModel()}
 		if prev, dup := seen[k]; dup {

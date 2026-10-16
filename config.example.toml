@@ -871,6 +871,9 @@ type = "claudecode"
 # - `model` is shorthand for options.model. `label` overrides the name in
 #   the notice. Other options (work_dir, mode, run_as_user) default to this
 #   agent's. / model 等同 options.model；label 改提示中的名称；其他选项默认继承主 agent。
+# - With run_as_user / run_as_env set, only agent types that support them
+#   (claudecode) may be fallbacks; others would run outside the isolation.
+#   设置 run_as_user/run_as_env 时，fallback 只能是支持隔离的类型（claudecode）。
 # - The fallback agent gets the last 6 user/assistant turns of the
 #   cc-connect session as plain-text context. Each agent keeps its own
 #   session, so the primary's --resume is untouched.
