@@ -81,7 +81,9 @@ func (m fallbackIntercept) catchesError(ev Event) bool {
 	case interceptRetriable:
 		return ev.ErrorKind.IsRetriable()
 	case interceptAnyError:
-		return true
+		// Between fallbacks: advance on provider-side failures (any error
+		// not classified otherwise), stop on user-caused or terminal ones.
+		return !ev.ErrorKind.IsTerminal()
 	}
 	return false
 }
@@ -106,6 +108,9 @@ type turnOutcome struct {
 	// blocked marks a turn that skipped the primary because of an earlier
 	// reset time (ResetAt).
 	blocked bool
+	// handoffBegun is true when the event loop already began the hand-off
+	// (beginHandoff); answerWithFallbacks ends it.
+	handoffBegun bool
 }
 
 // fallbackGuard is the turn-scoped context of a fallback run: the primary
@@ -164,8 +169,12 @@ type agentFallbackChain struct {
 	// Timestamp of the newest primary history entry the fallback agent has
 	// seen (History timestamps, not c.now, so the clocks always match).
 	handedOff map[string]fallbackWatermark
-	// owned maps each fallback state key to its conversation key.
-	owned map[string]string
+	// owned maps each fallback state key to its conversation key and the
+	// state object currently registered under it (nil until bound).
+	owned map[string]fallbackRegistration
+	// handoffs counts, per conversation key, the fallback hand-offs in
+	// progress (from the primary's failure until the chain is done).
+	handoffs map[string]int
 
 	blockedUntil time.Time
 	blockedKind  ErrorKind
@@ -192,7 +201,8 @@ func newAgentFallbackChain(specs []AgentFallbackSpec) *agentFallbackChain {
 		agents:    make([]Agent, len(specs)),
 		sessions:  make([]*SessionManager, len(specs)),
 		handedOff: make(map[string]fallbackWatermark),
-		owned:     make(map[string]string),
+		owned:     make(map[string]fallbackRegistration),
+		handoffs:  make(map[string]int),
 	}
 }
 
@@ -220,18 +230,68 @@ func fallbackStateKey(interactiveKey string, i int) string {
 func (c *agentFallbackChain) registerState(fbKey, interactiveKey string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.owned[fbKey] = interactiveKey
+	reg := c.owned[fbKey]
+	reg.owner = interactiveKey
+	c.owned[fbKey] = reg
 }
 
-// forget removes a fallback state from the registry once the engine has
-// removed the state itself (cleanup, /stop, idle close). Nil-safe.
-func (c *agentFallbackChain) forget(key string) {
-	if c == nil {
+// bindState records the state object now registered under fbKey.
+func (c *agentFallbackChain) bindState(fbKey string, st *interactiveState) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if reg, ok := c.owned[fbKey]; ok {
+		reg.state = st
+		c.owned[fbKey] = reg
+	}
+}
+
+type fallbackRegistration struct {
+	owner string
+	state *interactiveState
+}
+
+// beginHandoff / endHandoff bracket a fallback hand-off for a conversation.
+// While one is in progress the conversation's busy lock is live even if no
+// agent process is (fallbackTurnInProgress).
+func (c *agentFallbackChain) beginHandoff(interactiveKey string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.handoffs[interactiveKey]++
+}
+
+func (c *agentFallbackChain) endHandoff(interactiveKey string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.handoffs[interactiveKey] <= 1 {
+		delete(c.handoffs, interactiveKey)
 		return
+	}
+	c.handoffs[interactiveKey]--
+}
+
+func (c *agentFallbackChain) inHandoff(interactiveKey string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.handoffs[interactiveKey] > 0
+}
+
+// forgetLocked removes key from the registry when the engine removes st
+// from interactiveStates; the caller holds interactiveMu, so removal and
+// unregistration are one step. Only the registration bound to st is
+// removed: a newer turn that re-registered the key keeps it. Reports
+// whether st was a registered fallback state. Nil-safe.
+func (c *agentFallbackChain) forgetLocked(key string, st *interactiveState) bool {
+	if c == nil || st == nil {
+		return false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	reg, ok := c.owned[key]
+	if !ok || reg.state != st {
+		return false
+	}
 	delete(c.owned, key)
+	return true
 }
 
 // ownerOf returns the conversation key of a registered fallback state.
@@ -241,8 +301,8 @@ func (c *agentFallbackChain) ownerOf(key string) (string, bool) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	owner, ok := c.owned[key]
-	return owner, ok
+	reg, ok := c.owned[key]
+	return reg.owner, ok
 }
 
 // ownedStatesOf lists the registered fallback state keys of a conversation.
@@ -253,8 +313,8 @@ func (c *agentFallbackChain) ownedStatesOf(interactiveKey string) []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	var keys []string
-	for k, owner := range c.owned {
-		if owner == interactiveKey {
+	for k, reg := range c.owned {
+		if reg.owner == interactiveKey {
 			keys = append(keys, k)
 		}
 	}
@@ -286,6 +346,9 @@ func (e *Engine) fallbackTurnInProgress(interactiveKey string) bool {
 	if e.agentFallback == nil {
 		return false
 	}
+	if e.agentFallback.inHandoff(interactiveKey) {
+		return true
+	}
 	for _, key := range e.agentFallback.ownedStatesOf(interactiveKey) {
 		e.interactiveMu.Lock()
 		st := e.interactiveStates[key]
@@ -308,6 +371,14 @@ func (e *Engine) fallbackTurnInProgress(interactiveKey string) bool {
 // turn; that turn is then simply stopped like any running turn). A var only
 // so tests can shorten it.
 var stopDispatchWait = 2 * time.Second
+
+// testHookStopAfterCapture, when set by a test, runs in /stop after it
+// resolved the state to stop and before it takes that state's gate.
+var testHookStopAfterCapture func()
+
+// testHookAfterStateRemoved, when set by a test, runs right after
+// cleanupInteractiveState removed a state from interactiveStates.
+var testHookAfterStateRemoved func(key string)
 
 // testHookGuardedDispatch, when set by a test, runs inside a guarded
 // dispatch between its ownership check and the final pre-Send check.
@@ -471,6 +542,13 @@ func formatResetTime(t, now time.Time) string {
 func (e *Engine) answerWithFallbacks(guard fallbackGuard, cause turnOutcome) {
 	chain := e.agentFallback
 	in := cause.Input
+	// The hand-off keeps the conversation live for the stale-lock self-heal
+	// from the primary's failure (interceptTurn may have begun it already)
+	// until the chain is done, including the notice and between attempts.
+	if !cause.handoffBegun {
+		chain.beginHandoff(guard.interactiveKey)
+	}
+	defer chain.endHandoff(guard.interactiveKey)
 	if !cause.blocked {
 		chain.recordPrimaryFailure(cause.Kind, cause.ResetAt)
 	}
@@ -544,6 +622,7 @@ func (e *Engine) runFallbackTurn(guard fallbackGuard, i int, agent Agent, fbSess
 	defer fbSession.Unlock(fbGen)
 	chain.registerState(fbKey, interactiveKey)
 	state := e.getOrCreateInteractiveStateWith(fbKey, in.platform, in.replyCtx, fbSession, fbSessions, agent, ccKey)
+	chain.bindState(fbKey, state)
 	// Re-check now that the state is registered: a /stop that ran before
 	// registration could not see it (stopFallbackStates found nothing), but
 	// it marked the primary stopped / bumped the lock generation first.

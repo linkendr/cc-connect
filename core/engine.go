@@ -4641,8 +4641,11 @@ func (e *Engine) cleanupInteractiveState(sessionKey string, expected ...*interac
 		return
 	}
 	delete(e.interactiveStates, sessionKey)
+	e.agentFallback.forgetLocked(sessionKey, currentState)
 	e.interactiveMu.Unlock()
-	e.agentFallback.forget(sessionKey)
+	if e.agentFallback != nil && testHookAfterStateRemoved != nil {
+		testHookAfterStateRemoved(sessionKey)
+	}
 	e.cleanupFallbackStates(sessionKey)
 }
 
@@ -4747,15 +4750,11 @@ func (e *Engine) cleanupInteractiveStateForIdleToken(sessionKey string, expected
 	e.closeAgentSessionWithTimeout(sessionKey, agentSession, closePlatform, closeReplyCtx)
 
 	e.interactiveMu.Lock()
-	removed := false
 	if currentState, currentOk := e.interactiveStates[sessionKey]; currentOk && currentState == expected {
 		delete(e.interactiveStates, sessionKey)
-		removed = true
+		e.agentFallback.forgetLocked(sessionKey, expected)
 	}
 	e.interactiveMu.Unlock()
-	if removed {
-		e.agentFallback.forget(sessionKey)
-	}
 }
 
 // beginSessionClose registers an in-flight teardown for sessionKey and returns
@@ -5430,7 +5429,14 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		state.mu.Unlock()
 		slog.Warn("agent turn failed; handing it to the fallback chain",
 			"session_key", sessionKey, "kind", kind, "reset_at", resetAt, "error", errText)
-		return turnOutcome{Intercepted: true, Kind: kind, ResetAt: resetAt, ErrText: errText, Input: in}
+		handoff := false
+		if intercept == interceptRetriable && e.agentFallback != nil {
+			// From here until the chain is done the conversation counts as
+			// live for the stale-lock self-heal (answerWithFallbacks ends it).
+			e.agentFallback.beginHandoff(sessionKey)
+			handoff = true
+		}
+		return turnOutcome{Intercepted: true, Kind: kind, ResetAt: resetAt, ErrText: errText, Input: in, handoffBegun: handoff}
 	}
 
 	for {
@@ -11004,18 +11010,49 @@ func (e *Engine) stopInteractiveSessionSilently(sessionKey string) bool {
 }
 
 func (e *Engine) stopInteractiveSessionWithOptions(sessionKey string, notifyQueued bool) bool {
-	if e.agentFallback != nil {
-		// Agent fallback chain: make this stop mutually exclusive with a
-		// guarded send for the turn (see guardedDispatch).
-		if release := e.acquireDispatchForStop(sessionKey); release != nil {
-			defer release()
+	if e.agentFallback == nil {
+		stopped, _ := e.stopInteractiveSessionOnce(sessionKey, notifyQueued, nil)
+		return stopped
+	}
+	// Agent fallback chain: make this stop mutually exclusive with a guarded
+	// send for the turn (see guardedDispatch). Take the gate of one resolved
+	// state, then stop that same state; if the key now maps to a different
+	// state (e.g. a dead primary was restarted meanwhile), retry on it.
+	for attempt := 0; ; attempt++ {
+		target, release := e.acquireDispatchForStop(sessionKey)
+		if target == nil {
+			return false
+		}
+		expect := target
+		if attempt >= maxStopRetargets {
+			expect = nil // keep stopping whatever is there; do not spin
+		}
+		stopped, retry := e.stopInteractiveSessionOnce(sessionKey, notifyQueued, expect)
+		if release != nil {
+			release()
+		}
+		if !retry {
+			return stopped
 		}
 	}
+}
+
+// maxStopRetargets bounds how often /stop re-resolves a replaced state.
+const maxStopRetargets = 8
+
+// stopInteractiveSessionOnce stops the state registered for sessionKey.
+// With expect set, it only stops that object and reports retry=true when
+// the key maps to another state.
+func (e *Engine) stopInteractiveSessionOnce(sessionKey string, notifyQueued bool, expect *interactiveState) (stopped bool, retry bool) {
 	e.interactiveMu.Lock()
 	state, ok := e.interactiveStates[sessionKey]
 	if !ok || state == nil {
 		e.interactiveMu.Unlock()
-		return false
+		return false, false
+	}
+	if expect != nil && state != expect {
+		e.interactiveMu.Unlock()
+		return false, true
 	}
 	// Also stop a fallback agent that is answering for this session.
 	defer e.stopFallbackStates(sessionKey, notifyQueued)
@@ -11080,12 +11117,14 @@ func (e *Engine) stopInteractiveSessionWithOptions(sessionKey string, notifyQueu
 			SessionKey: sessionKey,
 		})
 
-		return true
+		return true, false
 	}
 
 normalCleanup:
 	state.markStopped()
 	delete(e.interactiveStates, sessionKey)
+	// A fallback state's end is one turn's detail, not a session end.
+	wasFallbackState := e.agentFallback.forgetLocked(sessionKey, state)
 	e.interactiveMu.Unlock()
 
 	if pending != nil {
@@ -11109,33 +11148,38 @@ normalCleanup:
 		slog.Info("session busy lock released after stop", "session_key", sessionKey)
 	}
 
-	e.hooks.Emit(HookEvent{
-		Event:      HookEventSessionEnded,
-		SessionKey: sessionKey,
-	})
-	e.agentFallback.forget(sessionKey)
+	if !wasFallbackState {
+		e.hooks.Emit(HookEvent{
+			Event:      HookEventSessionEnded,
+			SessionKey: sessionKey,
+		})
+	}
 
-	return true
+	return true, false
 }
 
-// acquireDispatchForStop raises stopRequested on the session's state and
-// takes its dispatch gate (bounded by stopDispatchWait). Returns the release
-// func, or nil when there is no state or the wait timed out.
-func (e *Engine) acquireDispatchForStop(sessionKey string) func() {
+// acquireDispatchForStop resolves the session's state once, raises its
+// stopRequested and takes its dispatch gate (bounded by stopDispatchWait).
+// Returns that state (nil = none) and the release func (nil when the wait
+// timed out).
+func (e *Engine) acquireDispatchForStop(sessionKey string) (*interactiveState, func()) {
 	e.interactiveMu.Lock()
 	st := e.interactiveStates[sessionKey]
 	e.interactiveMu.Unlock()
 	if st == nil {
-		return nil
+		return nil, nil
+	}
+	if hook := testHookStopAfterCapture; hook != nil {
+		hook()
 	}
 	st.stopRequested.Store(true)
 	gate := st.dispatchGate()
 	select {
 	case gate <- struct{}{}:
-		return func() { <-gate }
+		return st, func() { <-gate }
 	case <-time.After(stopDispatchWait):
 		slog.Warn("stop: dispatch still inside Send; stopping the running turn", "session_key", sessionKey)
-		return nil
+		return st, nil
 	}
 }
 

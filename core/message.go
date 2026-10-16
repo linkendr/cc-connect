@@ -475,6 +475,13 @@ const (
 	// "You've hit your session limit · resets 3pm"). Retriable on another
 	// agent, not on the same one until the reset time.
 	ErrorKindUsageLimit ErrorKind = "usage_limit"
+
+	// Terminal kinds: caused by the request or the user, not the provider.
+	// The agent fallback chain does not hand them to the next agent.
+	ErrorKindMaxTurns       ErrorKind = "max_turns"        // turn limit reached
+	ErrorKindMaxBudget      ErrorKind = "max_budget"       // cost budget reached
+	ErrorKindCancelled      ErrorKind = "cancelled"        // aborted / stopped
+	ErrorKindContextTooLong ErrorKind = "context_too_long" // prompt exceeds the context window
 )
 
 // UserQuestion represents a structured question from AskUserQuestion.

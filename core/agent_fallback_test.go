@@ -1535,3 +1535,192 @@ func TestAgentFallback_EmptyChainDrainAliveCalls(t *testing.T) {
 		t.Errorf("Alive() called %d times before Send, want 1 (main)", got)
 	}
 }
+
+// ---------- review round 4 ----------
+
+// R4-1: the state registered for the key is replaced between /stop's
+// capture and its gate acquisition, while the replacement's dispatch is
+// already inside Send. /stop must retarget the replacement: it raises the
+// replacement's stop request, waits for its gate, and only then stops it;
+// a later dispatch on it is refused.
+func TestAgentFallback_StopRetargetsReplacedState(t *testing.T) {
+	env := newFallbackEnv(t, nil, []scriptedTurn{okTurn("unused")})
+	session := env.e.sessions.GetOrCreateActive(fallbackTestKey)
+	gen, _ := session.TryLock()
+	a := &interactiveState{agentSession: newScriptedSession("a"), busySession: session, platform: env.p, replyCtx: "ctx", fallbackIntercept: interceptRetriable}
+	b := &interactiveState{agentSession: newScriptedSession("b"), busySession: session, platform: env.p, replyCtx: "ctx", fallbackIntercept: interceptRetriable}
+	env.e.interactiveMu.Lock()
+	env.e.interactiveStates[fallbackTestKey] = a
+	env.e.interactiveMu.Unlock()
+
+	live := func() bool { return !b.isStopped() && session.HoldsLock(gen) }
+	inSend, releaseSend, sendReturned := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	go func() {
+		_ = guardedDispatch(b, live, func() error {
+			close(inSend)
+			<-releaseSend
+			return nil
+		})
+		close(sendReturned)
+	}()
+	waitClosed(t, inSend, "replacement dispatch inside Send")
+
+	var once sync.Once
+	testHookStopAfterCapture = func() {
+		once.Do(func() { // dead-primary restart replaces A with B
+			env.e.interactiveMu.Lock()
+			env.e.interactiveStates[fallbackTestKey] = b
+			env.e.interactiveMu.Unlock()
+		})
+	}
+	t.Cleanup(func() { testHookStopAfterCapture = nil })
+
+	stopDone := make(chan bool, 1)
+	go func() { stopDone <- env.e.stopInteractiveSession(fallbackTestKey, env.p, "ctx") }()
+	waitTrue(t, "/stop to retarget the replacement", b.stopRequested.Load)
+	select {
+	case <-stopDone:
+		t.Fatal("/stop completed while the replacement's dispatch held its gate")
+	default:
+	}
+	if b.isStopped() {
+		t.Fatal("replacement marked stopped while its Send was in flight")
+	}
+	close(releaseSend)
+	waitClosed(t, sendReturned, "replacement Send")
+	if !<-stopDone {
+		t.Fatal("/stop found no session")
+	}
+	if !b.isStopped() || a.isStopped() {
+		t.Errorf("stopped a=%v b=%v, want only the replacement", a.isStopped(), b.isStopped())
+	}
+	if err := guardedDispatch(b, live, func() error { t.Error("dispatch after /stop was sent"); return nil }); !errors.Is(err, errTurnCancelled) {
+		t.Errorf("dispatch after /stop = %v, want errTurnCancelled", err)
+	}
+}
+
+// R4-2: the primary failed and the fallback notice is still being sent when
+// a second message arrives with an expired stale-lock threshold: the
+// conversation is in hand-off, so the lock is not broken and the original
+// turn still gets its fallback answer.
+func TestAgentFallback_StaleLockKeepsTurnDuringHandoff(t *testing.T) {
+	env := newFallbackEnv(t,
+		[]scriptedTurn{errorTurn(`API Error: {"error":{"type":"rate_limit_error"}}`, ErrorKindRateLimit)},
+		[]scriptedTurn{okTurn("fallback answer")},
+	)
+	env.e.SetStaleLockBreakAfter(time.Nanosecond)
+	env.primary.session.dieAfter = map[int]bool{0: true}
+	inNotice, releaseNotice := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	env.p.hookMu.Lock()
+	env.p.onSend = func(c string) {
+		if strings.Contains(c, "answering with") {
+			once.Do(func() { close(inNotice); <-releaseNotice })
+		}
+	}
+	env.p.hookMu.Unlock()
+
+	env.receive("first")
+	waitClosed(t, inNotice, "fallback notice")
+	env.receive("second")
+	if got := env.sentContaining("Previous request still processing"); got != 1 {
+		t.Errorf("second message not rejected during hand-off; sent = %#v", env.p.getSent())
+	}
+	if env.sentContaining("会话卡锁已自动恢复") != 0 {
+		t.Error("stale-lock recovery broke the lock during the hand-off")
+	}
+	close(releaseNotice)
+	env.waitSent("fallback answer")
+	env.waitIdle()
+	if env.e.agentFallback.inHandoff(fallbackTestKey) {
+		t.Error("hand-off not ended after the chain finished")
+	}
+}
+
+// R4-3: an old cleanup of fallback state A must not unregister B, which a
+// newer turn registered under the same key right after A was removed; /stop
+// still finds and stops B.
+func TestAgentFallback_CleanupKeepsReplacementRegistration(t *testing.T) {
+	env := newFallbackEnv(t, nil, []scriptedTurn{okTurn("unused")})
+	session := env.e.sessions.GetOrCreateActive(fallbackTestKey)
+	primary := &interactiveState{agentSession: newScriptedSession("p"), busySession: session, platform: env.p, replyCtx: "ctx"}
+	fbKey := fallbackStateKey(fallbackTestKey, 0)
+	a := &interactiveState{agentSession: newScriptedSession("fa"), busySession: NewSessionManager("").GetOrCreateActive("x"), platform: env.p, replyCtx: "ctx"}
+	b := &interactiveState{agentSession: newScriptedSession("fb"), busySession: NewSessionManager("").GetOrCreateActive("y"), platform: env.p, replyCtx: "ctx"}
+	chain := env.e.agentFallback
+	env.e.interactiveMu.Lock()
+	env.e.interactiveStates[fallbackTestKey] = primary
+	env.e.interactiveStates[fbKey] = a
+	env.e.interactiveMu.Unlock()
+	chain.registerState(fbKey, fallbackTestKey)
+	chain.bindState(fbKey, a)
+
+	var once sync.Once
+	testHookAfterStateRemoved = func(key string) {
+		if key != fbKey {
+			return
+		}
+		once.Do(func() { // a new turn registers B under the same key
+			chain.registerState(fbKey, fallbackTestKey)
+			env.e.interactiveMu.Lock()
+			env.e.interactiveStates[fbKey] = b
+			env.e.interactiveMu.Unlock()
+			chain.bindState(fbKey, b)
+		})
+	}
+	t.Cleanup(func() { testHookAfterStateRemoved = nil })
+
+	env.e.cleanupInteractiveState(fbKey, a)
+	if _, ok := chain.ownerOf(fbKey); !ok {
+		t.Fatal("old cleanup unregistered the replacement fallback state")
+	}
+	env.e.stopInteractiveSession(fallbackTestKey, env.p, "ctx")
+	if !b.isStopped() {
+		t.Error("/stop did not stop the replacement fallback state")
+	}
+}
+
+// R4-4a: a terminal error from a fallback (max turns) is shown; the chain
+// does not advance to the next fallback.
+func TestAgentFallback_TerminalErrorDoesNotAdvance(t *testing.T) {
+	env := newFallbackEnv(t,
+		[]scriptedTurn{usageLimitTurn(time.Time{})},
+		[]scriptedTurn{errorTurn("Reached max turns (25)", ErrorKindMaxTurns)},
+		[]scriptedTurn{okTurn("must not run")},
+	)
+	env.send("question")
+	env.waitSent("Reached max turns (25)")
+	if n := env.builtCount(1); n != 0 {
+		t.Errorf("fallback[1] built %d times after a terminal error, want 0", n)
+	}
+	if got := env.sentContaining("answering with OpenCode (model-1)"); got != 0 {
+		t.Errorf("chain advanced after a terminal error; sent = %#v", env.p.getSent())
+	}
+}
+
+// R4-4b: an auth/provider error from a fallback advances to the next one.
+func TestAgentFallback_ProviderErrorAdvances(t *testing.T) {
+	env := newFallbackEnv(t,
+		[]scriptedTurn{usageLimitTurn(time.Time{})},
+		[]scriptedTurn{errorTurn("ProviderAuthError: invalid api key", ErrorKindUnknown)},
+		[]scriptedTurn{okTurn("second fallback answer")},
+	)
+	env.send("question")
+	env.waitSent("second fallback answer")
+	if env.sentContaining("invalid api key") != 0 {
+		t.Errorf("provider error shown instead of advancing: %#v", env.p.getSent())
+	}
+}
+
+func TestErrorKindIsTerminal(t *testing.T) {
+	for _, k := range []ErrorKind{ErrorKindMaxTurns, ErrorKindMaxBudget, ErrorKindCancelled, ErrorKindContextTooLong} {
+		if !k.IsTerminal() || k.IsRetriable() {
+			t.Errorf("%q: terminal=%v retriable=%v", k, k.IsTerminal(), k.IsRetriable())
+		}
+	}
+	for _, k := range []ErrorKind{ErrorKindUnknown, ErrorKindRateLimit, ErrorKindOverloaded, ErrorKindUsageLimit} {
+		if k.IsTerminal() {
+			t.Errorf("%q must not be terminal", k)
+		}
+	}
+}

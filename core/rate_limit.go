@@ -278,3 +278,14 @@ func resolveResetDate(monS, dayS, hourS, minS, ampm, tz string, now time.Time) t
 	}
 	return t
 }
+
+// IsTerminal reports whether an ErrorKind is user-caused or terminal (max
+// turns, max budget, cancelled, context too long): another agent would hit
+// the same limit, or the user stopped the turn.
+func (k ErrorKind) IsTerminal() bool {
+	switch k {
+	case ErrorKindMaxTurns, ErrorKindMaxBudget, ErrorKindCancelled, ErrorKindContextTooLong:
+		return true
+	}
+	return false
+}
