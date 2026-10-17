@@ -18,38 +18,24 @@ func prepareProcessGroup(cmd *exec.Cmd) {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
 	cmd.SysProcAttr.Setpgid = true
-	cmd.Cancel = func() error { return killProcessGroup(cmd) }
 }
 
-// killProcessGroup SIGKILLs the child's whole process group.
-func killProcessGroup(cmd *exec.Cmd) error {
+// killProcessGroup SIGKILLs the child's whole process group (the child
+// alone if the group signal fails for another reason than "already gone").
+// Callers only use it while the child is unreaped (opencodeProc).
+func killProcessGroup(cmd *exec.Cmd) {
 	if cmd == nil || cmd.Process == nil {
-		return nil
+		return
 	}
 	if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil &&
 		!errors.Is(err, os.ErrProcessDone) && !errors.Is(err, syscall.ESRCH) {
-		return cmd.Process.Kill()
-	}
-	return nil
-}
-
-// processGroupID is the child's process group (its PID, via Setpgid).
-func processGroupID(cmd *exec.Cmd) int {
-	if cmd == nil || cmd.Process == nil {
-		return 0
-	}
-	return cmd.Process.Pid
-}
-
-// killGroup SIGKILLs process group pgid; a gone group is not an error.
-func killGroup(pgid int) {
-	if pgid > 0 {
-		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		_ = cmd.Process.Kill()
 	}
 }
 
-// processGroupAlive reports whether process group pgid still has members.
-func processGroupAlive(pgid int) bool {
-	err := syscall.Kill(-pgid, 0)
-	return err == nil || errors.Is(err, syscall.EPERM)
+// killedBySIGKILL reports whether the process was ended by SIGKILL (the
+// turn-end kill of a CLI that had not exited yet).
+func killedBySIGKILL(ps *os.ProcessState) bool {
+	ws, ok := ps.Sys().(syscall.WaitStatus)
+	return ok && ws.Signaled() && ws.Signal() == syscall.SIGKILL
 }

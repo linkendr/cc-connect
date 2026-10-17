@@ -90,14 +90,15 @@ func TestOpencodeCloseUnblocksEscapedStdoutHolder(t *testing.T) {
 	}
 }
 
-// (b) The CLI already exited 0, leaving a same-group descendant that holds
-// no pipe: Close still kills the group.
-func TestOpencodeCloseKillsLeftoverGroupAfterExit(t *testing.T) {
+// (b) The CLI exits 0 leaving a same-group descendant that holds no pipe:
+// the turn kills the group before reaping the CLI, so the descendant is
+// dead when the result is emitted; a process group created after the turn
+// is never signalled by Close.
+func TestOpencodeTurnEndKillsGroupBeforeReap(t *testing.T) {
 	script := `sleep 30 </dev/null >/dev/null 2>&1 &` + "\n" +
 		`echo "{\"type\":\"text\",\"part\":{\"text\":\"$!\"}}"` + "\nexit 0"
 	s, pid := startFakeTurn(t, script)
 	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
-	// Wait for the turn to finish (the CLI exited, the read loop is done).
 	deadline := time.After(5 * time.Second)
 	for done := false; !done; {
 		select {
@@ -107,18 +108,61 @@ func TestOpencodeCloseKillsLeftoverGroupAfterExit(t *testing.T) {
 			t.Fatal("turn did not finish")
 		}
 	}
-	if !alive(pid) {
-		t.Fatal("precondition: descendant already gone")
+	// SIGKILL was sent before the result; allow the kernel a moment to
+	// finish the kill and the zombie to be reaped by init.
+	gone := time.Now().Add(time.Second)
+	for alive(pid) && time.Now().Before(gone) {
+		time.Sleep(5 * time.Millisecond)
 	}
+	if alive(pid) {
+		t.Fatal("descendant still alive after the turn ended")
+	}
+
+	sentinel := exec.Command("sleep", "30")
+	sentinel.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := sentinel.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sentinel.Process.Kill(); _ = sentinel.Wait() })
 	if err := s.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	waitGone := time.Now().Add(2 * time.Second)
-	for alive(pid) && time.Now().Before(waitGone) {
-		time.Sleep(10 * time.Millisecond)
+	if !alive(sentinel.Process.Pid) {
+		t.Fatal("Close signalled a process group created after the turn")
 	}
-	if alive(pid) {
-		t.Fatal("descendant of an exited CLI survived Close")
+}
+
+// Item 2 (round 10): a descendant leaves the group, redirects stdout and
+// holds stderr; the CLI exits 0. At the stderr deadline the turn closes
+// its stderr read end and joins the reader, so the result arrives, all
+// reader goroutines exit, and Close returns at once.
+func TestOpencodeHeldStderrReaderJoinedAtDeadline(t *testing.T) {
+	if _, err := exec.LookPath("perl"); err != nil {
+		t.Skip("perl not available")
+	}
+	oldDelay, oldClose := pipeWaitDelay, closeWaitTimeout
+	pipeWaitDelay, closeWaitTimeout = 200*time.Millisecond, 500*time.Millisecond
+	t.Cleanup(func() { pipeWaitDelay, closeWaitTimeout = oldDelay, oldClose })
+
+	s, pid := startFakeTurn(t, `perl -e '$|=1; setpgrp(0,0); print "{\"type\":\"text\",\"part\":{\"text\":\"$$\"}}\n"; open(STDOUT, ">/dev/null"); sleep 30' &`+"\nexit 0")
+	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+	select {
+	case evt := <-s.Events():
+		if evt.Type != core.EventResult {
+			t.Fatalf("event = %v, want EventResult", evt.Type)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no result: the turn waited on the held stderr")
+	}
+	exited := make(chan struct{})
+	go func() { s.wg.Wait(); close(exited) }()
+	select {
+	case <-exited:
+	case <-time.After(time.Second):
+		t.Fatal("stderr reader still running after the turn ended")
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 }
 

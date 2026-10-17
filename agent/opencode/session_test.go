@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -384,6 +385,9 @@ func TestClassifyOpencodeText_Stderr(t *testing.T) {
 // writeFakeOpencode writes an executable stand-in for the opencode CLI.
 func writeFakeOpencode(t *testing.T, script string) string {
 	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake opencode CLI is a POSIX shell script")
+	}
 	path := filepath.Join(t.TempDir(), "opencode")
 	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+script+"\n"), 0o755); err != nil {
 		t.Fatal(err)
