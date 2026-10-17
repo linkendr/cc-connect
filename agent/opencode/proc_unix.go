@@ -36,6 +36,9 @@ func killProcessGroup(cmd *exec.Cmd) {
 // killedBySIGKILL reports whether the process was ended by SIGKILL (the
 // turn-end kill of a CLI that had not exited yet).
 func killedBySIGKILL(ps *os.ProcessState) bool {
+	if ps == nil {
+		return false
+	}
 	ws, ok := ps.Sys().(syscall.WaitStatus)
 	return ok && ws.Signaled() && ws.Signal() == syscall.SIGKILL
 }

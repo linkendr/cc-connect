@@ -19,3 +19,6 @@ func killProcessGroup(cmd *exec.Cmd) {
 
 // killedBySIGKILL: Windows has no signals.
 func killedBySIGKILL(ps *os.ProcessState) bool { return false }
+
+// leaderExited: not needed on Windows (no signals); unknown.
+func leaderExited(pid int) (exited, known bool) { return false, false }

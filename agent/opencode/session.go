@@ -55,9 +55,29 @@ type opencodeProc struct {
 	stdoutR *os.File
 	stderrR *os.File
 
-	mu      sync.Mutex
-	started bool // cmd.Start succeeded
-	reaped  bool // the leader is being or has been reaped: never signal its group again
+	mu         sync.Mutex
+	started    bool // cmd.Start succeeded
+	reaped     bool // the leader is being or has been reaped: never signal its group again
+	killedByUs bool // one of our kills was sent while the leader was still running
+}
+
+// markOurKill records, before a kill (p.mu held), whether the leader is
+// still running, so a SIGKILL exit can be told apart from an external one.
+// An unreadable state counts as running (our kill).
+func (p *opencodeProc) markOurKill() {
+	if p.cmd.Process == nil {
+		return
+	}
+	if exited, known := leaderExited(p.cmd.Process.Pid); !known || !exited {
+		p.killedByUs = true
+	}
+}
+
+// endedByOurKill reports whether a SIGKILL exit came from our own kill.
+func (p *opencodeProc) endedByOurKill() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.killedByUs
 }
 
 // kill SIGKILLs the turn's process group (the child alone on Windows), but
@@ -67,6 +87,7 @@ func (p *opencodeProc) kill() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.started && !p.reaped {
+		p.markOurKill()
 		killProcessGroup(p.cmd)
 	}
 }
@@ -80,6 +101,7 @@ func (p *opencodeProc) reap() error {
 		p.mu.Unlock()
 		return nil
 	}
+	p.markOurKill()
 	killProcessGroup(p.cmd)
 	killProcessGroup(p.cmd)
 	p.reaped = true
@@ -378,8 +400,10 @@ func (s *opencodeSession) readLoop(cmd *exec.Cmd, proc *opencodeProc, stderrBuf 
 	stderrMsg := stderrBuf.String()
 	// Non-zero exit is decided from the exit status, not from Wait's
 	// error: a clean exit (code 0) stays main's empty-result path, and so
-	// does a CLI that was still alive when the turn-end kill hit it.
-	nonZeroExit := cmd.ProcessState != nil && cmd.ProcessState.ExitCode() != 0 && !killedBySIGKILL(cmd.ProcessState)
+	// does a CLI that our own kill ended while it was still running. An
+	// external SIGKILL is a non-zero exit.
+	ourKill := killedBySIGKILL(cmd.ProcessState) && proc.endedByOurKill()
+	nonZeroExit := cmd.ProcessState != nil && cmd.ProcessState.ExitCode() != 0 && !ourKill
 	if stderrMsg == "" && nonZeroExit && !sawStdout && s.ctx.Err() == nil {
 		// The process failed without a word (crash, kill, bad flag that
 		// prints nothing): report an error instead of synthesizing an empty

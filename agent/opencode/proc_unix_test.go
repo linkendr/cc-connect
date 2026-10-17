@@ -5,6 +5,7 @@ package opencode
 import (
 	"context"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -185,5 +186,82 @@ func TestOpencodeCleanExitWithHeldStderrIsResult(t *testing.T) {
 		}
 	case <-time.After(pipeWaitDelay + 5*time.Second):
 		t.Fatal("no event")
+	}
+}
+
+// cliPID returns the PID of the session's running turn.
+func cliPID(t *testing.T, s *opencodeSession) int {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		s.procMu.Lock()
+		for p := range s.procs {
+			if p.cmd.Process != nil {
+				pid := p.cmd.Process.Pid
+				s.procMu.Unlock()
+				return pid
+			}
+		}
+		s.procMu.Unlock()
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("no running turn")
+	return 0
+}
+
+func firstEvent(t *testing.T, s *opencodeSession) core.Event {
+	t.Helper()
+	select {
+	case evt := <-s.Events():
+		return evt
+	case <-time.After(pipeWaitDelay + 5*time.Second):
+		t.Fatal("no event")
+		return core.Event{}
+	}
+}
+
+func needsLeaderState(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("leader exit state not readable on " + runtime.GOOS)
+	}
+}
+
+// Round 11 (1): the CLI is SIGKILLed by someone else before any output:
+// a provider-side error, so the fallback chain advances.
+func TestOpencodeExternalSIGKILLIsError(t *testing.T) {
+	needsLeaderState(t)
+	s, err := newOpencodeSession(context.Background(), writeFakeOpencode(t, "exec sleep 30"), nil, t.TempDir(), "", "default", "", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.Send("hi", "m1", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pid := cliPID(t, s)
+	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	evt := firstEvent(t, s)
+	if evt.Type != core.EventError || evt.ErrorKind != core.ErrorKindUnknown {
+		t.Fatalf("event = %v kind=%q, want provider-side EventError", evt.Type, evt.ErrorKind)
+	}
+}
+
+// Round 11 (2): our own turn-end kill of a CLI that closed its output but
+// kept running: unchanged, an empty result (no silent-crash error).
+func TestOpencodeOwnTurnEndKillIsResult(t *testing.T) {
+	needsLeaderState(t)
+	s, err := newOpencodeSession(context.Background(), writeFakeOpencode(t, "exec sleep 30 >&- 2>&-"), nil, t.TempDir(), "", "default", "", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.Send("hi", "m1", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if evt := firstEvent(t, s); evt.Type != core.EventResult {
+		t.Fatalf("event = %v (%v), want EventResult", evt.Type, evt.Error)
 	}
 }
