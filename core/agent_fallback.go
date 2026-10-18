@@ -29,7 +29,17 @@ import (
 // (Session.History): the last fallbackHistoryEntries user/assistant messages
 // the fallback agent has not seen yet are prepended to the prompt as plain
 // text. A successful fallback answer is appended to the primary session's
-// history, so /history and the next hand-off include it.
+// history, labelled with the fallback agent (HistoryEntry.Agent), so
+// /history and the next hand-off include it.
+//
+// Write-back: the primary's own conversation (Claude's --resume session)
+// never sees a fallback turn. When the primary next takes a turn, the
+// fallback-answered turns it has not seen (each fallback answer and the user
+// message it answered, after Session.PrimarySeenAt) are prepended to its
+// prompt in the hand-off format and caps. PrimarySeenAt moves to the newest
+// history entry whenever the primary answers, so nothing is written back
+// twice and the primary's own turns are never re-sent. It is part of the
+// persisted Session, so it survives a cc-connect restart.
 //
 // Not covered (TODO): multi-workspace projects (rejected at config load) and
 // the relay/bot-to-bot path (relay.go), which sends to the agent outside
@@ -611,7 +621,7 @@ func (e *Engine) answerWithFallbacks(guard fallbackGuard, cause turnOutcome) {
 		if i == last {
 			mode = interceptNone
 		}
-		out := e.runFallbackTurn(guard, i, agent, fbSessions, in, mode)
+		out := e.runFallbackTurn(guard, i, agent, label, fbSessions, in, mode)
 		if !out.Intercepted {
 			// Answered, failed with the error shown, or cancelled.
 			return
@@ -630,7 +640,7 @@ func (e *Engine) answerWithFallbacks(guard fallbackGuard, cause turnOutcome) {
 }
 
 // runFallbackTurn runs one turn of in on fallback agent i.
-func (e *Engine) runFallbackTurn(guard fallbackGuard, i int, agent Agent, fbSessions *SessionManager, in queuedMessage, mode fallbackIntercept) turnOutcome {
+func (e *Engine) runFallbackTurn(guard fallbackGuard, i int, agent Agent, label string, fbSessions *SessionManager, in queuedMessage, mode fallbackIntercept) turnOutcome {
 	chain := e.agentFallback
 	session, sessions := guard.session, guard.sessions
 	interactiveKey, ccSessionKey := guard.interactiveKey, guard.ccSessionKey
@@ -742,10 +752,11 @@ func (e *Engine) runFallbackTurn(guard fallbackGuard, i int, agent Agent, fbSess
 		slog.Warn("agent fallback: fallback agent failed", "index", i, "kind", out.Kind, "error", out.ErrText)
 		return out
 	}
-	// Mirror the fallback's answer into the primary session history.
+	// Mirror the fallback's answer into the primary session history,
+	// labelled, so the primary gets it written back on its next turn.
 	if hist := fbSession.GetHistory(0); len(hist) > histBefore {
 		if last := hist[len(hist)-1]; last.Role == "assistant" {
-			session.AddHistory("assistant", last.Content)
+			session.AddHistoryFrom("assistant", last.Content, label)
 			sessions.Save()
 		}
 	}
@@ -793,6 +804,51 @@ func (c *agentFallbackChain) historyPrefix(fbKey string, session *Session, fbSes
 		}
 		picked = append(picked, h)
 	}
+	return renderHistoryContext("[Context: earlier messages of this conversation, answered by another assistant. Oldest first.]", picked)
+}
+
+// primaryWritebackPrefix renders, for the primary agent's prompt, the
+// fallback-answered turns of session the primary has not seen: every
+// fallback answer (HistoryEntry.Agent set) newer than PrimarySeenAt, with
+// the user message it answered. User messages of turns that got no fallback
+// answer, and the primary's own answers, are left out. The current user
+// message (newest entry) has no answer yet, so it is never picked; the
+// prompt carries it. Same format and caps as the fallback hand-off.
+func primaryWritebackPrefix(session *Session) string {
+	since := session.GetPrimarySeenAt()
+	hist := session.GetHistory(0)
+	pick := make([]bool, len(hist))
+	for j, h := range hist {
+		if h.Role != "assistant" || h.Agent == "" || !h.Timestamp.After(since) || strings.TrimSpace(h.Content) == "" {
+			continue
+		}
+		pick[j] = true
+		// The question it answered: the nearest earlier user entry, unless
+		// another answer comes first.
+		for k := j - 1; k >= 0 && hist[k].Timestamp.After(since); k-- {
+			if hist[k].Role == "assistant" {
+				break
+			}
+			if hist[k].Role == "user" {
+				pick[k] = strings.TrimSpace(hist[k].Content) != ""
+				break
+			}
+		}
+	}
+	var picked []HistoryEntry
+	for j, h := range hist {
+		if pick[j] {
+			picked = append(picked, h)
+		}
+	}
+	return renderHistoryContext("[Context: messages of this conversation that another assistant answered while you were unavailable. Oldest first.]", picked)
+}
+
+// renderHistoryContext renders the newest fallbackHistoryEntries entries as
+// a plain-text context block ("" when there are none). Each entry is
+// truncated to fallbackHistoryEntryMaxRunes; an answer written by a fallback
+// agent is labelled with that agent.
+func renderHistoryContext(header string, picked []HistoryEntry) string {
 	if len(picked) > fallbackHistoryEntries {
 		picked = picked[len(picked)-fallbackHistoryEntries:]
 	}
@@ -800,11 +856,15 @@ func (c *agentFallbackChain) historyPrefix(fbKey string, session *Session, fbSes
 		return ""
 	}
 	var b strings.Builder
-	b.WriteString("[Context: earlier messages of this conversation, answered by another assistant. Oldest first.]\n")
+	b.WriteString(header)
+	b.WriteString("\n")
 	for _, h := range picked {
 		role := "User"
 		if h.Role == "assistant" {
 			role = "Assistant"
+			if h.Agent != "" {
+				role = "Assistant (" + h.Agent + ")"
+			}
 		}
 		b.WriteString(role)
 		b.WriteString(": ")

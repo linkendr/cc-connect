@@ -4168,6 +4168,10 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 		e.answerWithFallbacks(fallbackGuardFor(), blockedCause)
 	} else {
 		promptContent := e.buildSenderPrompt(msg.Content, msg.UserID, msg.UserName, msg.Platform, msg.SessionKey, msg.ChannelKey)
+		if fallbackChain != nil {
+			// Fallback turns the primary has not seen (agent_fallback.go).
+			promptContent = primaryWritebackPrefix(session) + promptContent
+		}
 
 		sendStart := time.Now()
 		state.mu.Lock()
@@ -6392,6 +6396,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			// History records the ORIGINAL baseResponse so the agent retains context of its own
 			// decision; only the outbound platform text gets rewritten/suppressed.
 			session.AddHistory("assistant", baseResponse)
+			if e.agentFallback != nil && !isFallbackState {
+				// The primary answered: it has now seen every history entry,
+				// including any fallback turns written back into this prompt.
+				session.MarkPrimarySeen()
+			}
 			sessions.Save()
 
 			isSilent := isSilentReply(baseResponse)
@@ -7181,6 +7190,10 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		drainEvents(as.Events())
 
 		session.AddHistory("user", queued.content)
+		if fallbackDrain {
+			// Fallback turns the primary has not seen (agent_fallback.go).
+			prompt = primaryWritebackPrefix(session) + prompt
+		}
 
 		sendDone := make(chan error, 1)
 		sendState := state

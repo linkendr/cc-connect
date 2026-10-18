@@ -56,6 +56,12 @@ type Session struct {
 	// sessions cannot permanently occupy the active slot.
 	ExplicitActivatedAt time.Time `json:"explicit_activated_at,omitempty"`
 
+	// PrimarySeenAt is the Timestamp of the newest History entry the
+	// project's primary agent has seen: set when the primary answers a turn
+	// (agent fallback chain only). Fallback answers after it are written
+	// back into the primary's next prompt (agent_fallback.go).
+	PrimarySeenAt time.Time `json:"primary_seen_at,omitempty"`
+
 	mu        sync.Mutex `json:"-"`
 	busy      bool       `json:"-"`
 	busySince time.Time  `json:"-"` // custom 2026-09-12: when the busy lock was acquired (stale-lock self-heal)
@@ -171,13 +177,37 @@ func (s *Session) ForceUnlock() bool {
 }
 
 func (s *Session) AddHistory(role, content string) {
+	s.AddHistoryFrom(role, content, "")
+}
+
+// AddHistoryFrom appends an entry written by agent (HistoryEntry.Agent);
+// agent is "" for user entries and the primary agent.
+func (s *Session) AddHistoryFrom(role, content, agent string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.History = append(s.History, HistoryEntry{
 		Role:      role,
 		Content:   content,
 		Timestamp: time.Now(),
+		Agent:     agent,
 	})
+}
+
+// MarkPrimarySeen records that the primary agent has seen every History
+// entry so far (PrimarySeenAt = newest entry's Timestamp).
+func (s *Session) MarkPrimarySeen() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if n := len(s.History); n > 0 {
+		s.PrimarySeenAt = s.History[n-1].Timestamp
+	}
+}
+
+// GetPrimarySeenAt reads PrimarySeenAt.
+func (s *Session) GetPrimarySeenAt() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.PrimarySeenAt
 }
 
 // recordPastAgentSessionID saves the current AgentSessionID to PastAgentSessionIDs
@@ -801,6 +831,7 @@ func (sm *SessionManager) saveLocked() {
 			// restart; otherwise a /switch followed by a crash would lose the
 			// exemption and the next message after restart would be rotated.
 			ExplicitActivatedAt: s.ExplicitActivatedAt,
+			PrimarySeenAt:       s.PrimarySeenAt,
 		}
 		s.mu.Unlock()
 	}

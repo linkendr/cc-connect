@@ -529,6 +529,10 @@ type HistoryEntry struct {
 	Role      string    `json:"role"` // "user" or "assistant"
 	Content   string    `json:"content"`
 	Timestamp time.Time `json:"timestamp"`
+	// Agent names the fallback agent that wrote an assistant entry (its
+	// notice label, e.g. "OpenCode (openai/gpt-6-sol)"). Empty for user
+	// entries and for the project's primary agent.
+	Agent string `json:"agent,omitempty"`
 }
 
 // AgentSessionInfo describes one session as reported by the agent backend.
