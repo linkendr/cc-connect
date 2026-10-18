@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -274,13 +275,20 @@ type fallbackEnv struct {
 
 func newFallbackEnv(t *testing.T, primaryTurns []scriptedTurn, fallbackTurns ...[]scriptedTurn) *fallbackEnv {
 	t.Helper()
+	return newFallbackEnvAt(t, "", primaryTurns, fallbackTurns...)
+}
+
+// newFallbackEnvAt is newFallbackEnv with sessions persisted at storePath
+// ("" = in memory); a second env on the same path models a restart.
+func newFallbackEnvAt(t *testing.T, storePath string, primaryTurns []scriptedTurn, fallbackTurns ...[]scriptedTurn) *fallbackEnv {
+	t.Helper()
 	env := &fallbackEnv{
 		t:       t,
 		p:       &hookPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}},
 		primary: &scriptedAgent{name: "primary", display: "Claude Code", session: newScriptedSession("primary-sid", primaryTurns...)},
 		now:     time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC),
 	}
-	env.e = NewEngine("test", env.primary, []Platform{env.p}, "", LangEnglish)
+	env.e = NewEngine("test", env.primary, []Platform{env.p}, storePath, LangEnglish)
 	t.Cleanup(func() { _ = env.e.Stop() })
 	if len(fallbackTurns) == 0 {
 		return env
@@ -2220,5 +2228,172 @@ func TestAgentFallback_ExpiredTeardownWaitClearsUnsafeResume(t *testing.T) {
 	agent.mu.Unlock()
 	if len(ids) != 2 || ids[0] != "" || ids[1] != "conv-y" {
 		t.Errorf("start resume IDs = %q, want [\"\" \"conv-y\"]", ids)
+	}
+}
+
+// ---------- write-back of fallback answers to the primary ----------
+
+const writebackHeader = "[Context: messages of this conversation that another assistant answered while you were unavailable. Oldest first.]"
+
+// TestAgentFallback_PrimarySeesFallbackAnswerOnNextTurn: after a fallback
+// answered a turn, the primary's next prompt carries that turn (question and
+// labelled answer) in the hand-off format, never its own earlier turn, and
+// the turn after that carries nothing again.
+func TestAgentFallback_PrimarySeesFallbackAnswerOnNextTurn(t *testing.T) {
+	env := newFallbackEnv(t,
+		[]scriptedTurn{
+			okTurn("first primary answer"),
+			usageLimitTurn(time.Time{}),
+			okTurn("third primary answer"),
+			okTurn("fourth primary answer"),
+		},
+		[]scriptedTurn{okTurn("fallback answer")},
+	)
+	env.send("first question")
+	env.waitSent("first primary answer")
+	env.send("second question")
+	env.waitSent("fallback answer")
+	env.send("third question")
+	env.waitSent("third primary answer")
+
+	prompts := env.primary.session.prompts()
+	if len(prompts) != 3 {
+		t.Fatalf("primary got %d prompts, want 3", len(prompts))
+	}
+	p := prompts[2]
+	want := writebackHeader + "\n" +
+		"User: second question\n" +
+		"Assistant (OpenCode (model-0)): fallback answer\n" +
+		"[End of context. The current message follows.]\n\n"
+	if !strings.HasPrefix(p, want) {
+		t.Fatalf("primary prompt does not start with the write-back block:\n got: %q\nwant prefix: %q", p, want)
+	}
+	if !strings.HasSuffix(p, "third question") {
+		t.Errorf("primary prompt does not end with the current message: %q", p)
+	}
+	for _, own := range []string{"first question", "first primary answer"} {
+		if strings.Contains(p, own) {
+			t.Errorf("write-back re-sent the primary's own turn (%q):\n%s", own, p)
+		}
+	}
+
+	env.send("fourth question")
+	env.waitSent("fourth primary answer")
+	if p := env.primary.session.prompts()[3]; strings.Contains(p, "[Context:") || strings.Contains(p, "fallback answer") {
+		t.Errorf("write-back sent twice:\n%s", p)
+	}
+}
+
+// TestAgentFallback_WritebackAfterBlockedWindowKeepsCaps: turns answered by
+// the fallback while the primary was blocked are written back when it is
+// back, capped like the hand-off (last fallbackHistoryEntries entries, each
+// truncated to fallbackHistoryEntryMaxRunes).
+func TestAgentFallback_WritebackAfterBlockedWindowKeepsCaps(t *testing.T) {
+	long := strings.Repeat("x", fallbackHistoryEntryMaxRunes+500)
+	env := newFallbackEnv(t,
+		[]scriptedTurn{
+			usageLimitTurn(time.Date(2026, 10, 16, 13, 0, 0, 0, time.UTC)), // env.now + 1h
+			okTurn("primary is back"),
+		},
+		[]scriptedTurn{okTurn("fb one"), okTurn("fb two"), okTurn("fb three"), okTurn(long)},
+	)
+	env.send("q1")
+	env.waitSent("fb one")
+	for _, q := range []string{"q2", "q3", "q4"} {
+		env.advance(time.Minute)
+		env.send(q)
+	}
+	env.waitIdle()
+	env.advance(2 * time.Hour)
+	env.send("q5")
+	env.waitSent("primary is back")
+
+	prompts := env.primary.session.prompts()
+	if len(prompts) != 2 {
+		t.Fatalf("primary got %d prompts, want 2", len(prompts))
+	}
+	p := prompts[1]
+	if !strings.HasPrefix(p, writebackHeader+"\n") {
+		t.Fatalf("no write-back block:\n%s", p)
+	}
+	// 4 fallback turns = 8 entries; the cap keeps the newest 6.
+	for _, want := range []string{"User: q2\n", "Assistant (OpenCode (model-0)): fb two\n", "User: q3\n", "Assistant (OpenCode (model-0)): fb three\n", "User: q4\n"} {
+		if !strings.Contains(p, want) {
+			t.Errorf("write-back missing %q:\n%s", want, p)
+		}
+	}
+	if strings.Contains(p, "User: q1\n") || strings.Contains(p, "fb one") {
+		t.Errorf("write-back exceeds %d entries:\n%s", fallbackHistoryEntries, p)
+	}
+	if strings.Contains(p, long) || !strings.Contains(p, "Assistant (OpenCode (model-0)): "+strings.Repeat("x", fallbackHistoryEntryMaxRunes-10)) {
+		t.Errorf("long fallback answer not truncated to %d runes", fallbackHistoryEntryMaxRunes)
+	}
+}
+
+// TestAgentFallback_WritebackSurvivesRestart: the labelled fallback answer
+// and what the primary has seen are part of the persisted session, so a
+// cc-connect restart neither loses the write-back nor sends it again.
+func TestAgentFallback_WritebackSurvivesRestart(t *testing.T) {
+	store := filepath.Join(t.TempDir(), "sessions.json")
+
+	// Run 1: the fallback answers q2, then the process restarts.
+	env := newFallbackEnvAt(t, store,
+		[]scriptedTurn{okTurn("a1 primary"), usageLimitTurn(time.Time{})},
+		[]scriptedTurn{okTurn("a2 fallback")},
+	)
+	env.send("q1")
+	env.waitSent("a1 primary")
+	env.send("q2")
+	env.waitSent("a2 fallback")
+	_ = env.e.Stop()
+
+	// Run 2: the primary gets the write-back once, then never again.
+	env = newFallbackEnvAt(t, store,
+		[]scriptedTurn{okTurn("a3 primary")},
+		[]scriptedTurn{okTurn("unused")},
+	)
+	env.send("q3")
+	env.waitSent("a3 primary")
+	p := env.primary.session.prompts()[0]
+	if !strings.Contains(p, "User: q2\nAssistant (OpenCode (model-0)): a2 fallback\n") || strings.Contains(p, "a1 primary") {
+		t.Fatalf("write-back after restart wrong:\n%s", p)
+	}
+	_ = env.e.Stop()
+
+	// Run 3: a second restart; the primary already saw the fallback turn.
+	env = newFallbackEnvAt(t, store,
+		[]scriptedTurn{okTurn("a4 primary")},
+		[]scriptedTurn{okTurn("unused")},
+	)
+	env.send("q4")
+	env.waitSent("a4 primary")
+	if p := env.primary.session.prompts()[0]; strings.Contains(p, "[Context:") {
+		t.Errorf("write-back re-sent after restart:\n%s", p)
+	}
+}
+
+// TestAgentFallback_QueuedTurnOnPrimaryGetsWriteback: a message queued
+// during a fallback turn is drained on the primary (drainPendingMessages)
+// and carries the fallback turn it did not see.
+func TestAgentFallback_QueuedTurnOnPrimaryGetsWriteback(t *testing.T) {
+	env := newFallbackEnv(t,
+		[]scriptedTurn{usageLimitTurn(time.Time{}), okTurn("queued primary answer")},
+		[]scriptedTurn{okTurn("fallback answer")},
+	)
+	entered, release := gate(env.fbs[0].session, 0)
+	env.receive("first question")
+	waitClosed(t, entered, "fallback turn")
+	env.receive("queued question")
+	env.waitQueued(1)
+	close(release)
+	env.waitSent("queued primary answer")
+	env.waitIdle()
+
+	prompts := env.primary.session.prompts()
+	if len(prompts) != 2 {
+		t.Fatalf("primary got %d prompts, want 2", len(prompts))
+	}
+	if !strings.Contains(prompts[1], "User: first question\nAssistant (OpenCode (model-0)): fallback answer\n") || !strings.HasSuffix(prompts[1], "queued question") {
+		t.Errorf("queued primary prompt lacks the write-back:\n%s", prompts[1])
 	}
 }

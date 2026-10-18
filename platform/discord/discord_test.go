@@ -1777,3 +1777,24 @@ func basePlatformFor(t *testing.T, pAny core.Platform) *Platform {
 	}
 }
 
+// ── group_reply_all_channels tests ────────────────────────────
+
+func TestRepliesWithoutMention_ChannelListOnly(t *testing.T) {
+	p := &Platform{groupReplyAllChannels: parseIDList("C-ask, C-two")}
+	if !p.repliesWithoutMention("G1", "C-ask") || !p.repliesWithoutMention("G1", "C-two") {
+		t.Fatal("listed channels should reply without a mention")
+	}
+	if p.repliesWithoutMention("G1", "C-other") {
+		t.Fatal("unlisted channel in the same guild must still need a mention")
+	}
+}
+
+func TestRepliesWithoutMention_GuildListStillWorks(t *testing.T) {
+	p := &Platform{groupReplyAllGuilds: []string{"G1"}}
+	if !p.repliesWithoutMention("G1", "C-any") {
+		t.Fatal("group_reply_all_guilds should still cover every channel of the guild")
+	}
+	if p.repliesWithoutMention("G2", "C-any") {
+		t.Fatal("other guild must need a mention")
+	}
+}

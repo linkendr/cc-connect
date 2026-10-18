@@ -871,8 +871,15 @@ type = "claudecode"
 # 达到最大轮数/预算、被取消或上下文超长时不再切换，直接显示错误。每条新消息都会先尝试主 agent；
 # 若主 agent 报告了恢复时间，则在该时间前直接使用 fallback[0]。
 #
-# - At most 3 entries; no entry may equal the primary (same type and model)
-#   or repeat another entry. / 最多 3 个；不能与主 agent 相同或重复。
+# - At most 3 entries; no entry may equal the primary (same type, model and
+#   options.env) or repeat another entry. / 最多 3 个；不能与主 agent 相同或重复
+#   （类型、模型和 options.env 都相同）。
+# - options.env is NOT inherited from the primary, and only differing env
+#   makes a same-type, same-model entry valid: e.g. the same claude CLI
+#   billed to an API key instead of the subscription login. ${VAR} in values
+#   is read from cc-connect's environment; an unset VAR (empty value) is
+#   rejected for such an entry. / options.env 不继承；同类型同模型的条目
+#   仅在 env 不同时有效，值中的 ${VAR} 从 cc-connect 的环境变量读取。
 # - `model` is shorthand for options.model. `label` overrides the name in
 #   the notice. Other options (work_dir, mode, run_as_user) default to this
 #   agent's. / model 等同 options.model；label 改提示中的名称；其他选项默认继承主 agent。
@@ -883,6 +890,9 @@ type = "claudecode"
 #   cc-connect session as plain-text context. Each agent keeps its own
 #   session, so the primary's --resume is untouched.
 #   fallback agent 会收到 cc-connect 会话最近 6 轮对话作为上下文；各 agent 会话独立。
+# - Write-back: on its next turn the primary gets the fallback-answered turns
+#   it has not seen (question + labelled answer, same 6-entry cap) before the
+#   message, once. / 主 agent 下一轮会先收到它未见过的 fallback 问答（仅一次）。
 # - Not supported with mode = "multi-workspace". / 不支持 multi-workspace 模式。
 # - OpenCode sends no permission requests (cc-connect cannot answer them), so
 #   with mode = "default" only Claude Code's prompts reach the chat; an
@@ -892,6 +902,13 @@ type = "claudecode"
 # fallback = [
 #   { type = "opencode", model = "openai/gpt-6-sol" },
 #   { type = "opencode", model = "deepseek/deepseek-v4-pro" },
+# ]
+#
+# Same claude CLI and model as the primary (model must equal options.model;
+# omit it if the primary sets none), on API credit / 同一 claude，改用 API key:
+# fallback = [
+#   { type = "claudecode", model = "opus", label = "Claude Code (API credit)", options = { env = { ANTHROPIC_API_KEY = "${CC_ANTHROPIC_CREDIT_KEY}" } } },
+#   { type = "opencode", model = "openai/gpt-6-sol" },
 # ]
 
 [projects.agent.options]
@@ -1414,6 +1431,8 @@ app_secret = "your-feishu-app-secret"
 # group_reply_all_guilds = ""  # Comma-separated guild IDs where group_reply_all is active (overrides group_reply_all)
 #                              # e.g. "123456789012345678,987654321098765432"; takes precedence over group_reply_all
 #                              # 逗号分隔的服务器 ID，仅在这些服务器无需 @ 也响应（优先于 group_reply_all）
+# group_reply_all_channels = ""  # Comma-separated channel IDs that respond without @mention; other channels still need it
+#                                # (a thread counts as its own channel) / 逗号分隔的频道 ID，这些频道无需 @ 也响应
 # share_session_in_channel = false  # If true, all users in a channel share one agent session / 频道共享会话
 # thread_isolation = false  # If true, cc-connect creates/uses Discord threads as session boundaries when the channel supports threads
 #                           # 设为 true 时，cc-connect 会在支持 thread 的 Discord 频道内按 thread 隔离会话

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -50,6 +51,7 @@ type Platform struct {
 	guildID                    string // optional: per-guild registration (instant) vs global (up to 1h propagation)
 	progressStyle              string
 	groupReplyAllGuilds        []string // guild IDs where groupReplyAll is active; "*" = all guilds
+	groupReplyAllChannels      []string // channel IDs that reply without a mention (group_reply_all_channels)
 	shareSessionInChannel      bool
 	threadIsolation            bool
 	respondToAtEveryoneAndHere bool
@@ -87,14 +89,12 @@ func New(opts map[string]any) (core.Platform, error) {
 	guildID, _ := opts["guild_id"].(string)
 	var groupReplyAllGuilds []string
 	if guilds, _ := opts["group_reply_all_guilds"].(string); guilds != "" {
-		for _, g := range strings.Split(guilds, ",") {
-			if g = strings.TrimSpace(g); g != "" {
-				groupReplyAllGuilds = append(groupReplyAllGuilds, g)
-			}
-		}
+		groupReplyAllGuilds = parseIDList(guilds)
 	} else if all, _ := opts["group_reply_all"].(bool); all {
 		groupReplyAllGuilds = []string{"*"}
 	}
+	channels, _ := opts["group_reply_all_channels"].(string)
+	groupReplyAllChannels := parseIDList(channels)
 	shareSessionInChannel, _ := opts["share_session_in_channel"].(bool)
 	threadIsolation, _ := opts["thread_isolation"].(bool)
 	respondToAtEveryoneAndHere, _ := opts["respond_to_at_everyone_and_here"].(bool)
@@ -134,6 +134,7 @@ func New(opts map[string]any) (core.Platform, error) {
 		guildID:                    guildID,
 		progressStyle:              progressStyle,
 		groupReplyAllGuilds:        groupReplyAllGuilds,
+		groupReplyAllChannels:      groupReplyAllChannels,
 		shareSessionInChannel:      shareSessionInChannel,
 		readyCh:                    make(chan struct{}),
 		threadIsolation:            threadIsolation,
@@ -189,6 +190,24 @@ func (p *Platform) isGroupReplyAllGuild(guildID string) bool {
 		}
 	}
 	return false
+}
+
+// repliesWithoutMention reports whether a guild message needs no @mention:
+// its guild is in group_reply_all(_guilds) or its channel is in
+// group_reply_all_channels. A thread counts as its own channel ID.
+func (p *Platform) repliesWithoutMention(guildID, channelID string) bool {
+	return p.isGroupReplyAllGuild(guildID) || slices.Contains(p.groupReplyAllChannels, channelID)
+}
+
+// parseIDList splits a comma-separated ID list and drops empty entries.
+func parseIDList(list string) []string {
+	var ids []string
+	for _, id := range strings.Split(list, ",") {
+		if id = strings.TrimSpace(id); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 func (p *Platform) makeSessionKey(channelID string, userID string) string {
@@ -620,7 +639,8 @@ func (p *Platform) buildSession() (*discordgo.Session, error) {
 			return
 		}
 
-		// In guild channels, only respond when the bot is @mentioned (unless group_reply_all).
+		// In guild channels, only respond when the bot is @mentioned (unless group_reply_all
+		// covers the guild or group_reply_all_channels lists the channel).
 		// Check both user mentions and role mentions (Discord auto-creates a managed role
 		// for each bot; users may @ the role instead of the user).
 		botRoleID := p.botRoleIDForGuild(m.GuildID)
@@ -628,7 +648,7 @@ func (p *Platform) buildSession() (*discordgo.Session, error) {
 			p.cacheBotRoleIDForGuild(s, m.GuildID, nil)
 			botRoleID = p.botRoleIDForGuild(m.GuildID)
 		}
-		if m.GuildID != "" && !p.isGroupReplyAllGuild(m.GuildID) {
+		if m.GuildID != "" && !p.repliesWithoutMention(m.GuildID, m.ChannelID) {
 			if !isDiscordBotMention(m, p.botID, botRoleID, p.respondToAtEveryoneAndHere) {
 				slog.Debug("discord: ignoring guild message without bot mention", "channel", m.ChannelID)
 				return

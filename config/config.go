@@ -1,6 +1,8 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -9,6 +11,7 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -697,9 +700,19 @@ func validateAgentFallback(prefix string, proj ProjectConfig) error {
 	_, primaryRunAs := proj.Agent.Options["run_as_user"]
 	_, primaryRunAsEnv := proj.Agent.Options["run_as_env"]
 	isolated := proj.RunAsUser != "" || len(proj.RunAsEnv) > 0 || primaryRunAs || primaryRunAsEnv
-	type key struct{ typ, model string }
+	// A fallback may run the primary's type and model when it is started with
+	// a different environment (e.g. the same claude CLI billed to an API key
+	// instead of the subscription login), so the env is part of the identity.
+	// Fallbacks do not inherit the primary's env (see fallbackInheritedOptions
+	// in cmd/cc-connect), so each side's own options.env is compared.
+	type key struct{ typ, model, env string }
 	primaryModel, _ := proj.Agent.Options["model"].(string)
-	seen := map[key]int{{strings.TrimSpace(proj.Agent.Type), strings.TrimSpace(primaryModel)}: -1}
+	primaryEnv, err := agentEnvFingerprint(proj.Agent.Options)
+	if err != nil {
+		return fmt.Errorf("config: %s.agent.options.env %w", prefix, err)
+	}
+	primaryKey := key{strings.TrimSpace(proj.Agent.Type), strings.TrimSpace(primaryModel), primaryEnv}
+	seen := map[key]int{primaryKey: -1}
 	for i, fb := range chain {
 		p := fmt.Sprintf("%s.agent.fallback[%d]", prefix, i)
 		typ := strings.TrimSpace(fb.Type)
@@ -736,16 +749,81 @@ func validateAgentFallback(prefix string, proj ProjectConfig) error {
 		if (isolated || ownRunAs || ownRunAsEnv) && !runAsCapableAgentTypes[typ] {
 			return fmt.Errorf("config: %s type %q does not support run_as_user/run_as_env; it would run as the cc-connect user, outside the project's isolation", p, typ)
 		}
-		k := key{typ, fb.EffectiveModel()}
+		fbEnv, err := agentEnvFingerprint(fb.Options)
+		if err != nil {
+			return fmt.Errorf("config: %s.options.env %w", p, err)
+		}
+		k := key{typ, fb.EffectiveModel(), fbEnv}
 		if prev, dup := seen[k]; dup {
 			if prev < 0 {
-				return fmt.Errorf("config: %s (%s, model %q) is the primary agent; a fallback must differ in type or model", p, typ, k.model)
+				return fmt.Errorf("config: %s (%s, model %q) is the primary agent; a fallback must differ in type, model or env", p, typ, k.model)
 			}
-			return fmt.Errorf("config: %s repeats fallback[%d] (%s, model %q)", p, prev, typ, k.model)
+			return fmt.Errorf("config: %s repeats fallback[%d] (%s, model %q, same env)", p, prev, typ, k.model)
+		}
+		if k.typ == primaryKey.typ && k.model == primaryKey.model && envOnlyBlankValues(fb.Options) {
+			// The only difference from the primary is env entries with empty
+			// values, typically an unset ${VAR} placeholder. The agent would
+			// run exactly like the primary that just failed.
+			return fmt.Errorf("config: %s (%s, model %q) differs from the primary agent only by empty options.env values; is a ${VAR} placeholder unset?", p, typ, k.model)
 		}
 		seen[k] = i
 	}
 	return nil
+}
+
+// agentEnvFingerprint returns a digest of an agent options map's "env"
+// table (sorted KEY=VALUE pairs), "" when no env is set. Only the digest is
+// kept, so env values (API keys) never reach an error message or log. A
+// non-table env or a non-string value is an error: the agent adapters
+// silently drop such entries.
+func agentEnvFingerprint(opts map[string]any) (string, error) {
+	pairs, err := agentEnvPairs(opts)
+	if err != nil || len(pairs) == 0 {
+		return "", err
+	}
+	sum := sha256.Sum256([]byte(strings.Join(pairs, "\x00")))
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// envOnlyBlankValues reports whether opts sets an env table whose values
+// are all empty.
+func envOnlyBlankValues(opts map[string]any) bool {
+	pairs, err := agentEnvPairs(opts)
+	if err != nil || len(pairs) == 0 {
+		return false
+	}
+	for _, kv := range pairs {
+		if _, v, _ := strings.Cut(kv, "="); v != "" {
+			return false
+		}
+	}
+	return true
+}
+
+func agentEnvPairs(opts map[string]any) ([]string, error) {
+	raw, ok := opts["env"]
+	if !ok || raw == nil {
+		return nil, nil
+	}
+	var pairs []string
+	switch env := raw.(type) {
+	case map[string]string:
+		for k, v := range env {
+			pairs = append(pairs, k+"="+v)
+		}
+	case map[string]any:
+		for k, v := range env {
+			s, isStr := v.(string)
+			if !isStr {
+				return nil, fmt.Errorf("[%s] must be a string, got %T", k, v)
+			}
+			pairs = append(pairs, k+"="+s)
+		}
+	default:
+		return nil, fmt.Errorf("must be a table of strings, got %T", raw)
+	}
+	sort.Strings(pairs)
+	return pairs, nil
 }
 
 // ProviderModelConfig defines a selectable model entry for a provider,
