@@ -16618,3 +16618,32 @@ func TestGetAllCommands_MenuSkillsLimitsSkillEntries(t *testing.T) {
 		t.Fatalf("menu_skills reset, skill entries = %v, want all 3", got)
 	}
 }
+
+// A skill left out of menu_skills is only hidden from the menu: typing
+// /name still runs it.
+func TestMenuSkills_UnlistedSkillStillRunsWhenTyped(t *testing.T) {
+	env := newFallbackEnv(t, []scriptedTurn{okTurn("research done")})
+	dir := t.TempDir()
+	skillDir := filepath.Join(dir, "research")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\ndescription: Research\n---\nSEARCH THE WEB CAREFULLY"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	env.e.skills.SetDirs([]string{dir})
+	env.e.SetMenuSkills([]string{"bro"})
+
+	for _, cmd := range env.e.GetAllCommands() {
+		if cmd.Command == "research" {
+			t.Fatalf("research is in the menu despite menu_skills = [bro]")
+		}
+	}
+
+	env.send("/research quinoa prices")
+	env.waitSent("research done")
+	prompts := env.primary.session.prompts()
+	if len(prompts) != 1 || !strings.Contains(prompts[0], "SEARCH THE WEB CAREFULLY") || !strings.Contains(prompts[0], "quinoa prices") {
+		t.Fatalf("typed /research did not run the skill; prompts = %q", prompts)
+	}
+}

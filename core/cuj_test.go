@@ -2592,3 +2592,52 @@ func TestCUJ_H5_WorkspaceSkillDiscoveryAndInvocation(t *testing.T) {
 	sent := p.getSent()
 	assertWorkspaceSkills(t, sent[len(sent)-1], "b", "a")
 }
+
+// ===========================================================================
+// CUJ-G7 · When the primary agent hits its usage limit, a fallback agent
+// answers; when the primary answers again it knows what the fallback said.
+//
+// User journey: ask → primary answers; ask → primary is capped, fallback
+// answers; ask "what did you just tell me?" → primary's reply shows it saw
+// the fallback's answer; ask again → nothing is repeated to the primary.
+// ===========================================================================
+
+func TestCUJ_G7_FallbackAnswerCarriesBackToPrimary(t *testing.T) {
+	env := newFallbackEnv(t,
+		[]scriptedTurn{
+			okTurn("primary: hello"),
+			usageLimitTurn(time.Time{}),
+			nil, // filled in from the prompt the primary receives
+			nil,
+		},
+		[]scriptedTurn{okTurn("fallback: the build is green")},
+	)
+	recall := func(n int) {
+		prompts := env.primary.session.prompts()
+		p := prompts[len(prompts)-1]
+		reply := "primary: I have no record of that"
+		if strings.Contains(p, "fallback: the build is green") {
+			reply = "primary: earlier you were told the build is green"
+		}
+		env.primary.session.mu.Lock()
+		env.primary.session.turns[n] = okTurn(fmt.Sprintf("%s (turn %d)", reply, n))
+		env.primary.session.mu.Unlock()
+	}
+	env.primary.session.beforeTurn = func(n int) {
+		if n >= 2 {
+			recall(n)
+		}
+	}
+
+	env.send("hi")
+	env.waitSent("primary: hello")
+
+	env.send("is the build green?")
+	env.waitSent("fallback: the build is green")
+
+	env.send("what did you just tell me?")
+	env.waitSent("primary: earlier you were told the build is green (turn 2)")
+
+	env.send("anything else?")
+	env.waitSent("primary: I have no record of that (turn 3)")
+}
