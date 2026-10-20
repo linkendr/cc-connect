@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16570,5 +16571,50 @@ func TestProcessInteractiveEvents_StreamingCard_BareNoReply_Suppressed(t *testin
 	}
 	if strings.Contains(card.finalContent(), "NO_REPLY") {
 		t.Fatalf("silent reply leaked NO_REPLY into the streaming card: %q", card.finalContent())
+	}
+}
+
+func TestGetAllCommands_MenuSkillsLimitsSkillEntries(t *testing.T) {
+	e := NewEngine("test", &stubAgent{}, nil, "", LangEnglish)
+	temp := t.TempDir()
+	for _, name := range []string{"bro", "research", "pstack-very-long-skill"} {
+		skillDir := filepath.Join(temp, name)
+		if err := os.MkdirAll(skillDir, 0o755); err != nil {
+			t.Fatalf("mkdir skill dir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\ndescription: Demo skill\n---\nDo demo"), 0o644); err != nil {
+			t.Fatalf("write skill file: %v", err)
+		}
+	}
+	e.skills.SetDirs([]string{temp})
+
+	skillNames := func() []string {
+		var names []string
+		for _, cmd := range e.GetAllCommands() {
+			if cmd.IsSkill {
+				names = append(names, cmd.Command)
+			}
+		}
+		slices.Sort(names)
+		return names
+	}
+
+	if got := skillNames(); len(got) != 3 {
+		t.Fatalf("without menu_skills, skill entries = %v, want all 3", got)
+	}
+
+	e.SetMenuSkills([]string{"/Bro", "research"})
+	if got := skillNames(); strings.Join(got, ",") != "bro,research" {
+		t.Fatalf("with menu_skills, skill entries = %v, want [bro research]", got)
+	}
+
+	e.SetMenuSkills([]string{})
+	if got := skillNames(); len(got) != 0 {
+		t.Fatalf("empty menu_skills, skill entries = %v, want none", got)
+	}
+
+	e.SetMenuSkills(nil)
+	if got := skillNames(); len(got) != 3 {
+		t.Fatalf("menu_skills reset, skill entries = %v, want all 3", got)
 	}
 }

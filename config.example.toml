@@ -767,6 +767,9 @@ name = "my-backend"
 #                                   # 隐藏 footer 第二行：工作区目录（默认 true 显示）
 # disabled_commands = ["restart", "upgrade", "cron"]  # Disable specific commands for this project
 #                                                     # 禁用该项目的指定命令
+# menu_skills = ["review", "research"]  # Only these skills go in the platform slash menu (default: all);
+#                                       # others still run when typed as /name
+#                                       # 仅这些技能出现在平台命令菜单（默认全部）
 #
 # filter_external_sessions: when true, /list /switch /delete only show sessions
 # created by cc-connect, hiding sessions from direct CLI usage in the same work_dir.
