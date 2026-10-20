@@ -402,9 +402,10 @@ type Engine struct {
 	bannedMu    sync.RWMutex
 
 	disabledCmds map[string]bool
+	menuSkills   map[string]bool  // nil = every skill goes in the bot menu; else only these names
 	adminFrom    string           // comma-separated user IDs for privileged commands; "*" = all allowed users; "" = deny
 	userRoles    *UserRoleManager // nil = legacy mode (no per-user policies)
-	userRolesMu  sync.RWMutex     // protects userRoles, disabledCmds, and adminFrom
+	userRolesMu  sync.RWMutex     // protects userRoles, disabledCmds, menuSkills, and adminFrom
 
 	rateLimiter         *RateLimiter
 	outgoingRL          *OutgoingRateLimiter
@@ -1267,6 +1268,22 @@ func resolveDisabledCmds(cmds []string) map[string]bool {
 		}
 	}
 	return m
+}
+
+// SetMenuSkills limits the skills registered in the platform command menu to
+// names. A nil slice keeps every skill. Skills left out of the menu can still
+// be run by typing /name.
+func (e *Engine) SetMenuSkills(names []string) {
+	e.userRolesMu.Lock()
+	defer e.userRolesMu.Unlock()
+	if names == nil {
+		e.menuSkills = nil
+		return
+	}
+	e.menuSkills = make(map[string]bool, len(names))
+	for _, n := range names {
+		e.menuSkills[strings.ToLower(strings.TrimPrefix(n, "/"))] = true
+	}
 }
 
 // GetDisabledCommands returns the list of disabled command IDs for this project.
@@ -10681,6 +10698,7 @@ func (e *Engine) GetAllCommands() []BotCommandInfo {
 
 	e.userRolesMu.RLock()
 	disabledCmds := e.disabledCmds
+	menuSkillAllow := e.menuSkills
 	e.userRolesMu.RUnlock()
 
 	// Collect built-in  commands (use primary name, first in names list)
@@ -10737,6 +10755,9 @@ func (e *Engine) GetAllCommands() []BotCommandInfo {
 			continue
 		}
 		if disabledCmds[lowerName] {
+			continue
+		}
+		if menuSkillAllow != nil && !menuSkillAllow[lowerName] {
 			continue
 		}
 		seenCmds[lowerName] = true
