@@ -62,6 +62,12 @@ func TestParseRunIncompleteStreams(t *testing.T) {
 	}
 }
 
+func TestParseListRejectsBrokenRunId(t *testing.T) {
+	if _, err := parseList(strings.NewReader("p/a PKG 140c1821\n")); err == nil {
+		t.Fatal("want error for a PKG entry")
+	}
+}
+
 func TestParseRunEmptyIsError(t *testing.T) {
 	if _, err := parseRun(strings.NewReader("garbage\n")); err == nil {
 		t.Fatal("want error for stream without events")
@@ -72,14 +78,14 @@ func TestParseListRejectsMalformedLine(t *testing.T) {
 	if _, err := parseList(strings.NewReader("p/a TestX\n")); err == nil {
 		t.Fatal("want error for a line without commit")
 	}
-	k, err := parseList(strings.NewReader("# c\n\np/a TestX 140c1821\n"))
-	if err != nil || !k["p/a TestX"] {
+	k, err := parseList(strings.NewReader("# c\n\np/a TestX 140c1821\nflaky p/a TestY 140c1821\n"))
+	if err != nil || !k.failing["p/a TestX"] || !k.flaky["p/a TestY"] {
 		t.Fatalf("got %v %v", k, err)
 	}
 }
 
 func TestEvaluate(t *testing.T) {
-	known := failureSet{"p/a TestKnown": true, "p/a TestFixed": true}
+	known := knownList{failing: failureSet{"p/a TestKnown": true, "p/a TestFixed": true}, flaky: failureSet{"p/a TestFlaky": true}}
 	r := func(ids ...string) failureSet {
 		s := failureSet{}
 		for _, id := range ids {
@@ -95,7 +101,9 @@ func TestEvaluate(t *testing.T) {
 	}{
 		{"only known", []failureSet{r("p/a TestKnown", "p/a TestFixed"), r("p/a TestKnown", "p/a TestFixed"), r("p/a TestKnown", "p/a TestFixed")}, 0, 0},
 		{"new failure twice", []failureSet{r("p/a TestKnown", "p/a TestFixed", "p/a TestNew"), r("p/a TestKnown", "p/a TestFixed", "p/a TestNew"), r("p/a TestKnown", "p/a TestFixed")}, 1, 0},
-		{"new failure once is a flake", []failureSet{r("p/a TestKnown", "p/a TestFixed", "p/a TestFlaky"), r("p/a TestKnown", "p/a TestFixed"), r("p/a TestKnown", "p/a TestFixed")}, 0, 0},
+		{"new failure once is still new", []failureSet{r("p/a TestKnown", "p/a TestFixed", "p/a TestNew"), r("p/a TestKnown", "p/a TestFixed"), r("p/a TestKnown", "p/a TestFixed")}, 1, 0},
+		{"listed flaky test failing once is accepted", []failureSet{r("p/a TestKnown", "p/a TestFixed", "p/a TestFlaky"), r("p/a TestKnown", "p/a TestFixed"), r("p/a TestKnown", "p/a TestFixed")}, 0, 0},
+		{"listed flaky test passing everywhere is accepted", []failureSet{r("p/a TestKnown", "p/a TestFixed"), r("p/a TestKnown", "p/a TestFixed"), r("p/a TestKnown", "p/a TestFixed")}, 0, 0},
 		{"listed test now passes", []failureSet{r("p/a TestKnown"), r("p/a TestKnown"), r("p/a TestKnown")}, 0, 1},
 		{"listed test failing once is kept", []failureSet{r("p/a TestKnown", "p/a TestFixed"), r("p/a TestKnown"), r("p/a TestKnown")}, 0, 0},
 		{"broken run once is enough", []failureSet{r("p/a TestKnown", "p/a TestFixed", "p/z PKG"), r("p/a TestKnown", "p/a TestFixed"), r("p/a TestKnown", "p/a TestFixed")}, 1, 0},

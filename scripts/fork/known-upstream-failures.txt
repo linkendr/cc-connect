@@ -2,16 +2,17 @@
 #
 # Checker: go run ./scripts/fork/checkknown   (run `pnpm build` in web/ first, as upstream CI does)
 # It runs `go test ./... -race -json` 3 times and applies these rules:
-#   1. A test counts as FAILING when it fails in at least 2 of the 3 runs (a single failure is
-#      treated as a flake and ignored).
-#   2. The check fails (exit 1) if a failing test is not listed here: a NEW failure.
-#   3. The check fails (exit 1) if a listed test fails in 0 of the 3 runs: upstream fixed it,
-#      delete the line. A listed test that fails in exactly 1 run is kept without error.
-#   4. A broken run is a NEW failure the first time it is seen, with no 2-of-3 rule: a package
-#      that reports no result (stream cut short), a test that started and never finished, a
-#      build failure, or a package that fails with no failing test. These cannot be listed.
+#   1. Any failing test that is not listed here is a NEW failure, even when it fails in one run
+#      only. The check exits 1.
+#   2. A listed test that fails in 0 of the 3 runs is STALE (upstream fixed it): delete the line.
+#      The check exits 1.
+#   3. A line starting with `flaky` names a test that upstream itself fails only sometimes. It may
+#      fail in any number of runs, including none, without a stale error.
+#   4. A broken run is a NEW failure the first time it is seen: a package that reports no result
+#      (stream cut short), a test that started and never finished, a build failure, or a package
+#      that fails with no failing test. These cannot be listed.
 #
-# Format, one entry per line: <import path> <test id> <upstream commit where it was measured failing>
+# Format, one entry per line: [flaky] <import path> <test id> <upstream commit where it was measured failing>
 # Test id includes subtests ("Parent/sub"). Measured 2026-10-27 on chenhg5/cc-connect main
 # 140c1821 under upstream CI steps (pnpm build, go build ./..., go test ./... -race), 3 of 3 runs.
 # Evidence: ~/Workspace/_scratch/fork-conflicts-2026-10-26/ev7/up/per-test-failcounts.txt
@@ -30,3 +31,4 @@ github.com/chenhg5/cc-connect/core TestSkills_ScheduledJobsUseExecutionWorkspace
 github.com/chenhg5/cc-connect/core TestSkills_WorkspaceResolutionIsolationAndDirectoryChanges 140c1821
 github.com/chenhg5/cc-connect/daemon TestInstallLaunchd_TightensExistingPlistFrom0644 140c1821
 github.com/chenhg5/cc-connect/daemon TestLaunchdStatusUsesUserDomainWhenGUIDomainUnavailable 140c1821
+flaky github.com/chenhg5/cc-connect/core TestCUJ_A5_FileReachesAgent 140c1821

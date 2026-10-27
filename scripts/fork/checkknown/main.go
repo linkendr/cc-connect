@@ -21,10 +21,7 @@ import (
 	"strings"
 )
 
-const (
-	defaultList = "scripts/fork/known-upstream-failures.txt"
-	failQuorum  = 2 // a test counts as failing when it fails in at least this many runs
-)
+const defaultList = "scripts/fork/known-upstream-failures.txt"
 
 // testEvent is the subset of a test2json event this check reads.
 type testEvent struct {
@@ -123,9 +120,16 @@ func parseRun(r io.Reader) (failureSet, error) {
 	return failed, nil
 }
 
-// parseList reads the known-failures file into a set of ids.
-func parseList(r io.Reader) (failureSet, error) {
-	known := failureSet{}
+// knownList is the parsed known-failures file.
+type knownList struct {
+	failing failureSet // must fail in at least one run; passing in every run makes the entry stale
+	flaky   failureSet // may fail in any number of runs, including none
+}
+
+// parseList reads the known-failures file. A line is
+// "<package> <test> <commit>" or "flaky <package> <test> <commit>".
+func parseList(r io.Reader) (knownList, error) {
+	k := knownList{failing: failureSet{}, flaky: failureSet{}}
 	sc := bufio.NewScanner(r)
 	n := 0
 	for sc.Scan() {
@@ -135,16 +139,26 @@ func parseList(r io.Reader) (failureSet, error) {
 			continue
 		}
 		f := strings.Fields(line)
-		if len(f) != 3 {
-			return nil, fmt.Errorf("line %d: want <package> <test> <upstream commit>, got %q", n, line)
+		set := k.failing
+		if len(f) > 0 && f[0] == "flaky" {
+			set = k.flaky
+			f = f[1:]
 		}
-		known[f[0]+" "+f[1]] = true
+		if len(f) != 3 {
+			return k, fmt.Errorf("line %d: want [flaky] <package> <test> <upstream commit>, got %q", n, line)
+		}
+		id := f[0] + " " + f[1]
+		if isStructural(id) {
+			return k, fmt.Errorf("line %d: a broken-run id cannot be listed: %q", n, line)
+		}
+		set[id] = true
 	}
-	return known, sc.Err()
+	return k, sc.Err()
 }
 
 // evaluate applies the rules to the runs and returns the problems found.
-func evaluate(known failureSet, runs []failureSet) (newFailures, stale []string) {
+// Any failure that is not listed is new, even when it appears in one run only.
+func evaluate(known knownList, runs []failureSet) (newFailures, stale []string) {
 	counts := map[string]int{}
 	for _, r := range runs {
 		for id := range r {
@@ -152,15 +166,14 @@ func evaluate(known failureSet, runs []failureSet) (newFailures, stale []string)
 		}
 	}
 	for id, c := range counts {
-		if isStructural(id) {
+		switch {
+		case isStructural(id):
 			newFailures = append(newFailures, fmt.Sprintf("%s (broken run, seen in %d of %d runs)", id, c, len(runs)))
-			continue
-		}
-		if c >= failQuorum && !known[id] {
+		case !known.failing[id] && !known.flaky[id]:
 			newFailures = append(newFailures, fmt.Sprintf("%s (failed %d of %d runs)", id, c, len(runs)))
 		}
 	}
-	for id := range known {
+	for id := range known.failing {
 		if counts[id] == 0 {
 			stale = append(stale, id)
 		}
@@ -272,6 +285,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "checkknown: FAIL (%d new, %d stale)\n", len(newF), len(stale))
 		return 1
 	}
-	fmt.Fprintf(stdout, "checkknown: OK (%d runs, %d known upstream failures)\n", len(runs), len(known))
+	fmt.Fprintf(stdout, "checkknown: OK (%d runs, %d listed upstream failures)\n", len(runs), len(known.failing)+len(known.flaky))
 	return 0
 }
