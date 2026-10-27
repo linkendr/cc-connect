@@ -284,9 +284,9 @@ This repository is a fork. Upstream content above is unchanged. The fork rule: m
 Merge gate for upstream syncs (upstream `.gitignore` ignores `scripts/`, so these files were added with `git add -f`; edits to tracked files still show in `git status`): upstream `main` has tests that fail in CI today, so a plain `go test ./...` is red before our changes. The fork keeps `scripts/fork/known-upstream-failures.txt` (one test per line with the upstream commit where it was measured failing) and a checker. Before landing any sync or fork change on `fallback`:
 
 ```
-cd web && pnpm install --frozen-lockfile && pnpm build && cd ..
+cd web && pnpm install --frozen-lockfile && pnpm build && cd ..   # pnpm 10, as upstream CI; pnpm 12 rejects web/pnpm-workspace.yaml
 go build ./... && go vet ./...
 go run ./scripts/fork/checkknown
 ```
 
-The checker runs `go test ./... -race -json` three times. It exits 1 on a NEW failure (a test not in the list that fails in at least 2 of 3 runs) and on a STALE entry (a listed test that passes in all runs: upstream fixed it, delete the line). Add a line only for a failure that also fails on upstream `main`, with that commit. Never add a test that fails because of fork code. `go run ./scripts/fork/checkknown FILE...` checks saved `-json` output instead of running the tests.
+The checker runs `go test ./... -race -json` three times. It exits 1 on a NEW failure (a test not in the list that fails in at least 2 of 3 runs) and on a STALE entry (a listed test that passes in all runs: upstream fixed it, delete the line). The checker also fails on a cut-short or crashed run (a package with no result, a test that started and never finished, a build failure, an unexpected `go test` exit code) and exits 2 when `web/dist` is missing. Add a line only for a failure that also fails on upstream `main`, with that commit. Never add a test that fails because of fork code. `go run ./scripts/fork/checkknown FILE...` checks saved `-json` output instead of running the tests.

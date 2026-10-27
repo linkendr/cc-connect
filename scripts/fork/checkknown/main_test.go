@@ -13,6 +13,7 @@ func TestParseRunTestAndPackageFailures(t *testing.T) {
 		`{"Action":"fail","Package":"p/a"}`,
 		`{"Action":"fail","Package":"p/b"}`,
 		`{"Action":"pass","Package":"p/c","Test":"TestOK"}`,
+		`{"Action":"pass","Package":"p/c"}`,
 		`not json`,
 	)
 	got, err := parseRun(strings.NewReader(in))
@@ -21,6 +22,43 @@ func TestParseRunTestAndPackageFailures(t *testing.T) {
 	}
 	if !got["p/a TestX"] || !got["p/b PKG"] || got["p/a PKG"] || len(got) != 2 {
 		t.Fatalf("unexpected set %v", got)
+	}
+}
+
+func TestParseRunIncompleteStreams(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want []string
+	}{
+		{"known test failed then package never finished",
+			stream(`{"Action":"run","Package":"p/a","Test":"TestKnown"}`, `{"Action":"fail","Package":"p/a","Test":"TestKnown"}`),
+			[]string{"p/a PKG", "p/a TestKnown"}},
+		{"test started and never finished",
+			stream(`{"Action":"run","Package":"p/a","Test":"TestCrash"}`, `{"Action":"fail","Package":"p/a"}`),
+			[]string{"p/a TestCrash"}},
+		{"build failure",
+			stream(`{"Action":"fail","Package":"p/a","FailedBuild":"p/a"}`),
+			[]string{"p/a PKG"}},
+		{"clean pass",
+			stream(`{"Action":"run","Package":"p/a","Test":"TestOK"}`, `{"Action":"pass","Package":"p/a","Test":"TestOK"}`, `{"Action":"pass","Package":"p/a"}`),
+			nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseRun(strings.NewReader(tc.in))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %v want %v", got, tc.want)
+			}
+			for _, w := range tc.want {
+				if !got[w] {
+					t.Fatalf("got %v want %v", got, tc.want)
+				}
+			}
+		})
 	}
 }
 

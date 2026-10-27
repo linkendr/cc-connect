@@ -28,21 +28,28 @@ const (
 
 // testEvent is the subset of a test2json event this check reads.
 type testEvent struct {
-	Action  string `json:"Action"`
-	Package string `json:"Package"`
-	Test    string `json:"Test"`
+	Action      string `json:"Action"`
+	Package     string `json:"Package"`
+	Test        string `json:"Test"`
+	FailedBuild string `json:"FailedBuild"`
 }
 
 // failureSet maps "<package> <test>" (or "<package> PKG") to a flag.
 type failureSet map[string]bool
 
-// parseRun reads one `go test -json` stream and returns the failing test ids.
-// A package-level failure with no failing test in that package is recorded as
-// "<package> PKG".
+// parseRun reads one `go test -json` stream and returns the failing ids.
+//
+//   - a test with a fail event is "<package> <test>";
+//   - a test that started and never finished (crash, os.Exit, kill) is also failing;
+//   - a package that failed to build, never reported a result (stream cut
+//     short), or failed with no failing test is "<package> PKG".
 func parseRun(r io.Reader) (failureSet, error) {
 	failed := failureSet{}
+	pkgSeen := map[string]bool{}
+	pkgDone := map[string]bool{}
 	pkgFailed := map[string]bool{}
 	pkgHasTestFail := map[string]bool{}
+	running := map[string]bool{} // "<package> <test>" started, no result yet
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 1<<20), 64<<20)
 	events := 0
@@ -56,15 +63,34 @@ func parseRun(r io.Reader) (failureSet, error) {
 			continue
 		}
 		events++
-		if ev.Action != "fail" || ev.Package == "" {
+		if ev.Package == "" {
 			continue
 		}
-		if ev.Test == "" {
+		pkgSeen[ev.Package] = true
+		id := ev.Package + " " + ev.Test
+		switch ev.Action {
+		case "run":
+			if ev.Test != "" {
+				running[id] = true
+			}
+		case "pass", "skip", "fail":
+			if ev.Test == "" {
+				pkgDone[ev.Package] = true
+				if ev.Action == "fail" {
+					pkgFailed[ev.Package] = true
+				}
+				continue
+			}
+			delete(running, id)
+			if ev.Action == "fail" {
+				pkgHasTestFail[ev.Package] = true
+				failed[id] = true
+			}
+		}
+		if ev.FailedBuild != "" {
 			pkgFailed[ev.Package] = true
-			continue
+			pkgHasTestFail[ev.Package] = false
 		}
-		pkgHasTestFail[ev.Package] = true
-		failed[ev.Package+" "+ev.Test] = true
 	}
 	if err := sc.Err(); err != nil {
 		return nil, err
@@ -72,8 +98,13 @@ func parseRun(r io.Reader) (failureSet, error) {
 	if events == 0 {
 		return nil, errors.New("no test2json events in input")
 	}
-	for p := range pkgFailed {
-		if !pkgHasTestFail[p] {
+	for id := range running {
+		failed[id] = true
+		pkg, _, _ := strings.Cut(id, " ")
+		pkgHasTestFail[pkg] = true
+	}
+	for p := range pkgSeen {
+		if !pkgDone[p] || (pkgFailed[p] && !pkgHasTestFail[p]) {
 			failed[p+" PKG"] = true
 		}
 	}
@@ -123,19 +154,43 @@ func evaluate(known failureSet, runs []failureSet) (newFailures, stale []string)
 	return newFailures, stale
 }
 
+// runGoTest runs the suite once. It cross-checks go test's exit code with the
+// stream: exit 0 with a failing id, or exit 1 with no failing id, is an error.
 func runGoTest() (failureSet, error) {
 	cmd := exec.Command("go", "test", "./...", "-race", "-json")
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = os.Stderr
-	// go test exits 1 when tests fail; only an unparseable stream is an error.
+	code := 0
 	if err := cmd.Run(); err != nil {
 		var ee *exec.ExitError
 		if !errors.As(err, &ee) {
 			return nil, err
 		}
+		code = ee.ExitCode()
 	}
-	return parseRun(&out)
+	set, err := parseRun(&out)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case code > 1 || code < 0:
+		return nil, fmt.Errorf("go test exited with code %d (not a test failure)", code)
+	case code == 0 && len(set) > 0:
+		return nil, fmt.Errorf("go test exited 0 but the stream has %d failing ids", len(set))
+	case code == 1 && len(set) == 0:
+		return nil, errors.New("go test exited 1 but the stream has no failing id")
+	}
+	return set, nil
+}
+
+// checkWebDist fails early when the web assets that web/embed.go embeds are missing.
+func checkWebDist() error {
+	entries, err := os.ReadDir("web/dist")
+	if err != nil || len(entries) == 0 {
+		return errors.New("web/dist is missing or empty: run `pnpm install --frozen-lockfile && pnpm build` in web/ with pnpm 10 first")
+	}
+	return nil
 }
 
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
@@ -176,6 +231,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 			runs = append(runs, r)
 		}
 	} else {
+		if err := checkWebDist(); err != nil {
+			fmt.Fprintln(stderr, "checkknown:", err)
+			return 2
+		}
 		for i := 0; i < *runsN; i++ {
 			r, err := runGoTest()
 			if err != nil {
