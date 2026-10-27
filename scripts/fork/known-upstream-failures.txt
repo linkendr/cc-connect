@@ -30,5 +30,6 @@ github.com/chenhg5/cc-connect/core TestSkills_ScheduledJobsUseExecutionWorkspace
 github.com/chenhg5/cc-connect/core TestSkills_ScheduledJobsUseExecutionWorkspace/timer/override=false 140c1821
 github.com/chenhg5/cc-connect/core TestSkills_WorkspaceResolutionIsolationAndDirectoryChanges 140c1821
 github.com/chenhg5/cc-connect/daemon TestInstallLaunchd_TightensExistingPlistFrom0644 140c1821
-github.com/chenhg5/cc-connect/daemon TestLaunchdStatusUsesUserDomainWhenGUIDomainUnavailable 140c1821
 flaky github.com/chenhg5/cc-connect/core TestCUJ_A5_FileReachesAgent 140c1821
+flaky github.com/chenhg5/cc-connect/tests/release_local/engine_matrix TestUnknownSlashCommandNotifiesThenFallsThroughToAgent 0c5141da
+flaky github.com/chenhg5/cc-connect/core TestDeleteMode_SubmitBlocksActiveSession 0c5141da

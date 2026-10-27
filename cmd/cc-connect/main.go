@@ -548,6 +548,9 @@ func main() {
 			engine.SetDisabledCommands(proj.DisabledCommands)
 		}
 
+		// Wire the skill allowlist for platform command menus
+		engine.SetMenuSkills(proj.MenuSkills)
+
 		// Wire admin allowlist for privileged commands
 		engine.SetAdminFrom(proj.AdminFrom)
 
@@ -1927,6 +1930,9 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 
 	// Reload disabled commands
 	engine.SetDisabledCommands(proj.DisabledCommands)
+
+	// Reload the skill menu allowlist
+	engine.SetMenuSkills(proj.MenuSkills)
 
 	// Reload admin allowlist
 	engine.SetAdminFrom(proj.AdminFrom)
