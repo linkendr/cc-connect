@@ -34,6 +34,18 @@ type testEvent struct {
 	FailedBuild string `json:"FailedBuild"`
 }
 
+const (
+	pkgSuffix        = " PKG"
+	unfinishedSuffix = " (unfinished)"
+)
+
+// isStructural reports whether id marks a broken run (cut-short stream, crash,
+// build failure) instead of an ordinary test failure. One such id in any run
+// is a problem; ordinary failures need failQuorum runs.
+func isStructural(id string) bool {
+	return strings.HasSuffix(id, pkgSuffix) || strings.HasSuffix(id, unfinishedSuffix)
+}
+
 // failureSet maps "<package> <test>" (or "<package> PKG") to a flag.
 type failureSet map[string]bool
 
@@ -99,7 +111,7 @@ func parseRun(r io.Reader) (failureSet, error) {
 		return nil, errors.New("no test2json events in input")
 	}
 	for id := range running {
-		failed[id] = true
+		failed[id+unfinishedSuffix] = true
 		pkg, _, _ := strings.Cut(id, " ")
 		pkgHasTestFail[pkg] = true
 	}
@@ -140,6 +152,10 @@ func evaluate(known failureSet, runs []failureSet) (newFailures, stale []string)
 		}
 	}
 	for id, c := range counts {
+		if isStructural(id) {
+			newFailures = append(newFailures, fmt.Sprintf("%s (broken run, seen in %d of %d runs)", id, c, len(runs)))
+			continue
+		}
 		if c >= failQuorum && !known[id] {
 			newFailures = append(newFailures, fmt.Sprintf("%s (failed %d of %d runs)", id, c, len(runs)))
 		}

@@ -36,7 +36,7 @@ func TestParseRunIncompleteStreams(t *testing.T) {
 			[]string{"p/a PKG", "p/a TestKnown"}},
 		{"test started and never finished",
 			stream(`{"Action":"run","Package":"p/a","Test":"TestCrash"}`, `{"Action":"fail","Package":"p/a"}`),
-			[]string{"p/a TestCrash"}},
+			[]string{"p/a TestCrash (unfinished)"}},
 		{"build failure",
 			stream(`{"Action":"fail","Package":"p/a","FailedBuild":"p/a"}`),
 			[]string{"p/a PKG"}},
@@ -98,6 +98,8 @@ func TestEvaluate(t *testing.T) {
 		{"new failure once is a flake", []failureSet{r("p/a TestKnown", "p/a TestFixed", "p/a TestFlaky"), r("p/a TestKnown", "p/a TestFixed"), r("p/a TestKnown", "p/a TestFixed")}, 0, 0},
 		{"listed test now passes", []failureSet{r("p/a TestKnown"), r("p/a TestKnown"), r("p/a TestKnown")}, 0, 1},
 		{"listed test failing once is kept", []failureSet{r("p/a TestKnown", "p/a TestFixed"), r("p/a TestKnown"), r("p/a TestKnown")}, 0, 0},
+		{"broken run once is enough", []failureSet{r("p/a TestKnown", "p/a TestFixed", "p/z PKG"), r("p/a TestKnown", "p/a TestFixed"), r("p/a TestKnown", "p/a TestFixed")}, 1, 0},
+		{"unfinished test once is enough", []failureSet{r("p/a TestKnown", "p/a TestFixed", "p/a TestCrash (unfinished)"), r("p/a TestKnown", "p/a TestFixed"), r("p/a TestKnown", "p/a TestFixed")}, 1, 0},
 		{"package failure twice", []failureSet{r("p/a TestKnown", "p/a TestFixed", "p/z PKG"), r("p/a TestKnown", "p/a TestFixed", "p/z PKG"), r("p/a TestKnown", "p/a TestFixed")}, 1, 0},
 	}
 	for _, tc := range tests {

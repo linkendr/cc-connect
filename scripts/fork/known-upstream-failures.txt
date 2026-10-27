@@ -7,8 +7,9 @@
 #   2. The check fails (exit 1) if a failing test is not listed here: a NEW failure.
 #   3. The check fails (exit 1) if a listed test fails in 0 of the 3 runs: upstream fixed it,
 #      delete the line. A listed test that fails in exactly 1 run is kept without error.
-#   4. A package that fails with no failing test (build error, panic, timeout) is a NEW failure
-#      when that happens in at least 2 of the 3 runs.
+#   4. A broken run is a NEW failure the first time it is seen, with no 2-of-3 rule: a package
+#      that reports no result (stream cut short), a test that started and never finished, a
+#      build failure, or a package that fails with no failing test. These cannot be listed.
 #
 # Format, one entry per line: <import path> <test id> <upstream commit where it was measured failing>
 # Test id includes subtests ("Parent/sub"). Measured 2026-10-27 on chenhg5/cc-connect main
