@@ -32,3 +32,4 @@ github.com/chenhg5/cc-connect/core TestSkills_WorkspaceResolutionIsolationAndDir
 github.com/chenhg5/cc-connect/daemon TestInstallLaunchd_TightensExistingPlistFrom0644 140c1821
 flaky github.com/chenhg5/cc-connect/core TestCUJ_A5_FileReachesAgent 140c1821
 flaky github.com/chenhg5/cc-connect/tests/release_local/engine_matrix TestUnknownSlashCommandNotifiesThenFallsThroughToAgent 0c5141da
+flaky github.com/chenhg5/cc-connect/core TestDeleteMode_SubmitBlocksActiveSession 0c5141da
