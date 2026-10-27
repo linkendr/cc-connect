@@ -1,0 +1,31 @@
+# Known upstream test failures (fork-only file; the fork's merge gate for upstream syncs).
+#
+# Checker: go run ./scripts/fork/checkknown   (run `pnpm build` in web/ first, as upstream CI does)
+# It runs `go test ./... -race -json` 3 times and applies these rules:
+#   1. A test counts as FAILING when it fails in at least 2 of the 3 runs (a single failure is
+#      treated as a flake and ignored).
+#   2. The check fails (exit 1) if a failing test is not listed here: a NEW failure.
+#   3. The check fails (exit 1) if a listed test fails in 0 of the 3 runs: upstream fixed it,
+#      delete the line. A listed test that fails in exactly 1 run is kept without error.
+#   4. A package that fails with no failing test (build error, panic, timeout) is a NEW failure
+#      when that happens in at least 2 of the 3 runs.
+#
+# Format, one entry per line: <import path> <test id> <upstream commit where it was measured failing>
+# Test id includes subtests ("Parent/sub"). Measured 2026-10-27 on chenhg5/cc-connect main
+# 140c1821 under upstream CI steps (pnpm build, go build ./..., go test ./... -race), 3 of 3 runs.
+# Evidence: ~/Workspace/_scratch/fork-conflicts-2026-10-26/ev7/up/per-test-failcounts.txt
+#
+github.com/chenhg5/cc-connect/agent/claudecode TestRunClaudeUsageProbe_ReturnsWhenReaderFinishesFirst 140c1821
+github.com/chenhg5/cc-connect/agent/codex TestListSkills_ExcludesClaudeDisabledAndCachedSkills 140c1821
+github.com/chenhg5/cc-connect/agent/pi TestAgent_ModelGetSet 140c1821
+github.com/chenhg5/cc-connect/core TestCUJ_H5_WorkspaceSkillDiscoveryAndInvocation 140c1821
+github.com/chenhg5/cc-connect/core TestInteractiveKeyForSessionKey_CarriesWorkspacePrefix 140c1821
+github.com/chenhg5/cc-connect/core TestSessionCommands_TwoTopicsListOwnSessions 140c1821
+github.com/chenhg5/cc-connect/core TestSessionContextForKey_AppliesDirOverride 140c1821
+github.com/chenhg5/cc-connect/core TestSessionContextForKey_TwoTopicsIsolated 140c1821
+github.com/chenhg5/cc-connect/core TestSkills_ScheduledJobsUseExecutionWorkspace 140c1821
+github.com/chenhg5/cc-connect/core TestSkills_ScheduledJobsUseExecutionWorkspace/cron/override=false 140c1821
+github.com/chenhg5/cc-connect/core TestSkills_ScheduledJobsUseExecutionWorkspace/timer/override=false 140c1821
+github.com/chenhg5/cc-connect/core TestSkills_WorkspaceResolutionIsolationAndDirectoryChanges 140c1821
+github.com/chenhg5/cc-connect/daemon TestInstallLaunchd_TightensExistingPlistFrom0644 140c1821
+github.com/chenhg5/cc-connect/daemon TestLaunchdStatusUsesUserDomainWhenGUIDomainUnavailable 140c1821
