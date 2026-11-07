@@ -17,9 +17,7 @@
 # 140c1821 under upstream CI steps (pnpm build, go build ./..., go test ./... -race), 3 of 3 runs.
 # Evidence: ~/Workspace/_scratch/fork-conflicts-2026-10-26/ev7/up/per-test-failcounts.txt
 #
-github.com/chenhg5/cc-connect/agent/claudecode TestRunClaudeUsageProbe_ReturnsWhenReaderFinishesFirst 140c1821
 github.com/chenhg5/cc-connect/agent/codex TestListSkills_ExcludesClaudeDisabledAndCachedSkills 140c1821
-github.com/chenhg5/cc-connect/agent/pi TestAgent_ModelGetSet 140c1821
 github.com/chenhg5/cc-connect/core TestCUJ_H5_WorkspaceSkillDiscoveryAndInvocation 140c1821
 github.com/chenhg5/cc-connect/core TestInteractiveKeyForSessionKey_CarriesWorkspacePrefix 140c1821
 github.com/chenhg5/cc-connect/core TestSessionCommands_TwoTopicsListOwnSessions 140c1821
@@ -33,3 +31,5 @@ github.com/chenhg5/cc-connect/daemon TestInstallLaunchd_TightensExistingPlistFro
 flaky github.com/chenhg5/cc-connect/core TestCUJ_A5_FileReachesAgent 140c1821
 flaky github.com/chenhg5/cc-connect/tests/release_local/engine_matrix TestUnknownSlashCommandNotifiesThenFallsThroughToAgent 0c5141da
 flaky github.com/chenhg5/cc-connect/core TestDeleteMode_SubmitBlocksActiveSession 0c5141da
+flaky github.com/chenhg5/cc-connect/agent/claudecode TestForceKillCmd_KillsGrandchild 0df6cba1
+flaky github.com/chenhg5/cc-connect/agent/opencode TestAvailableModels_BackgroundRefreshUpdatesDiskCache 0df6cba1

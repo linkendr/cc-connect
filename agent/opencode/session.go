@@ -224,7 +224,7 @@ func (s *opencodeSession) Send(prompt string, messageID string, images []core.Im
 	if err != nil {
 		_ = stdoutR.Close()
 		_ = stdoutW.Close()
-		return fmt.Errorf("opencodeSession: stderr pipe: %w", err)
+		return fmt.Errorf("opencodeSession: stderr pipe: %w: %w", core.ErrAgentProcessStart, err)
 	}
 	cmd.Stdout = stdoutW
 	cmd.Stderr = stderrW
@@ -240,7 +240,7 @@ func (s *opencodeSession) Send(prompt string, messageID string, images []core.Im
 	if startErr != nil {
 		_ = stdoutR.Close()
 		_ = stderrR.Close()
-		return fmt.Errorf("opencodeSession: start: %w", startErr)
+		return fmt.Errorf("opencodeSession: start: %w: %w", core.ErrAgentProcessStart, startErr)
 	}
 
 	proc.stdoutR, proc.stderrR = stdoutR, stderrR
@@ -410,7 +410,7 @@ func (s *opencodeSession) readLoop(cmd *exec.Cmd, proc *opencodeProc, stderrBuf 
 		// successful result. Unclassified = provider-side for the agent
 		// fallback chain.
 		slog.Error("opencodeSession: process exited without output", "error", turnErr)
-		evt := core.Event{Type: core.EventError, Error: fmt.Errorf("opencode exited without output: %v", turnErr)}
+		evt := core.Event{Type: core.EventError, Error: fmt.Errorf("opencode: %w: %v", core.ErrAgentExitedWithoutOutput, turnErr)}
 		select {
 		case s.events <- evt:
 		case <-s.ctx.Done():
@@ -787,7 +787,7 @@ func (s *opencodeSession) Close() error {
 		// Report it: a reader is still running, so the engine must not
 		// resume this conversation into a new process (it marks the key
 		// unsafe).
-		return fmt.Errorf("opencode: read loop did not exit within %s", closeWaitTimeout)
+		return fmt.Errorf("opencode: read loop did not exit within %s: %w", closeWaitTimeout, core.ErrAgentCloseTimeout)
 	}
 	return nil
 }

@@ -560,11 +560,19 @@ const (
 
 	// Agent fallback chain notices (see agent_fallback.go). Distinct from
 	// MsgRateLimited, which is cc-connect's own inbound throttle.
-	MsgAgentFallbackUsageLimit MsgKey = "agent_fallback_usage_limit"
-	MsgAgentFallbackRateLimit  MsgKey = "agent_fallback_rate_limit"
-	MsgAgentFallbackOverloaded MsgKey = "agent_fallback_overloaded"
-	MsgAgentFallbackFailed     MsgKey = "agent_fallback_failed"
-	MsgAgentFallbackBlocked    MsgKey = "agent_fallback_blocked"
+	MsgAgentFallbackUsageLimit  MsgKey = "agent_fallback_usage_limit"
+	MsgAgentFallbackRateLimit   MsgKey = "agent_fallback_rate_limit"
+	MsgAgentFallbackOverloaded  MsgKey = "agent_fallback_overloaded"
+	MsgAgentFallbackFailed      MsgKey = "agent_fallback_failed"
+	MsgAgentFallbackBlocked     MsgKey = "agent_fallback_blocked"
+	MsgAgentFallbackNoAnswer    MsgKey = "agent_fallback_no_answer"
+	MsgAgentFallbackAllFailed   MsgKey = "agent_fallback_all_failed"
+	MsgAgentFallbackStartFail   MsgKey = "agent_fallback_start_fail"
+	MsgSessionReset             MsgKey = "session_reset"
+	MsgAgentCloseTimeout        MsgKey = "agent_close_timeout"
+	MsgAgentProcessStartFailed  MsgKey = "agent_process_start_failed"
+	MsgAgentProcessExited       MsgKey = "agent_process_exited"
+	MsgAgentExitedWithoutOutput MsgKey = "agent_exited_without_output"
 
 	MsgWhoamiTitle     MsgKey = "whoami_title"
 	MsgWhoamiCardTitle MsgKey = "whoami_card_title"
@@ -3490,6 +3498,62 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "%s 用量上限持續到 %s，改由 %s 回答",
 		LangJapanese:           "%s は %s まで利用上限です。%s で回答します",
 		LangSpanish:            "%s está en su límite de uso hasta %s; responde %s",
+	},
+	MsgAgentFallbackNoAnswer: {
+		LangEnglish:            "fallback agent exited without an answer",
+		LangChinese:            "备用 agent 退出且没有给出回答",
+		LangTraditionalChinese: "備用 agent 結束且沒有給出回答",
+		LangJapanese:           "フォールバック agent が回答なしで終了しました",
+		LangSpanish:            "el agente de respaldo terminó sin dar respuesta",
+	},
+	MsgAgentFallbackStartFail: {
+		LangEnglish:            "fallback agent could not be started",
+		LangChinese:            "备用 agent 无法启动",
+		LangTraditionalChinese: "備用 agent 無法啟動",
+		LangJapanese:           "フォールバック agent を起動できませんでした",
+		LangSpanish:            "no se pudo iniciar el agente de respaldo",
+	},
+	MsgSessionReset: {
+		LangEnglish:            "session reset",
+		LangChinese:            "会话已重置",
+		LangTraditionalChinese: "會話已重置",
+		LangJapanese:           "セッションがリセットされました",
+		LangSpanish:            "sesión reiniciada",
+	},
+	MsgAgentExitedWithoutOutput: {
+		LangEnglish:            "the agent exited without any output",
+		LangChinese:            "Agent 退出且没有任何输出",
+		LangTraditionalChinese: "Agent 結束且沒有任何輸出",
+		LangJapanese:           "Agent が出力なしで終了しました",
+		LangSpanish:            "el agente terminó sin ninguna salida",
+	},
+	MsgAgentCloseTimeout: {
+		LangEnglish:            "the agent did not stop in time",
+		LangChinese:            "Agent 未能及时停止",
+		LangTraditionalChinese: "Agent 未能及時停止",
+		LangJapanese:           "Agent が時間内に停止しませんでした",
+		LangSpanish:            "el agente no se detuvo a tiempo",
+	},
+	MsgAgentProcessStartFailed: {
+		LangEnglish:            "the agent process could not be started",
+		LangChinese:            "无法启动 Agent 进程",
+		LangTraditionalChinese: "無法啟動 Agent 程序",
+		LangJapanese:           "Agent プロセスを起動できませんでした",
+		LangSpanish:            "no se pudo iniciar el proceso del agente",
+	},
+	MsgAgentProcessExited: {
+		LangEnglish:            "agent process exited",
+		LangChinese:            "Agent 进程已退出",
+		LangTraditionalChinese: "Agent 程序已結束",
+		LangJapanese:           "Agent プロセスが終了しました",
+		LangSpanish:            "el proceso del agente terminó",
+	},
+	MsgAgentFallbackAllFailed: {
+		LangEnglish:            "all fallback agents failed",
+		LangChinese:            "所有备用 agent 均失败",
+		LangTraditionalChinese: "所有備用 agent 均失敗",
+		LangJapanese:           "すべてのフォールバック agent が失敗しました",
+		LangSpanish:            "todos los agentes de respaldo fallaron",
 	},
 	MsgPsSent: {
 		LangEnglish:            "✅ P.S. delivered.",
