@@ -7193,7 +7193,7 @@ channelClosed:
 		p := state.platform
 		state.mu.Unlock()
 		e.cleanupInteractiveState(sessionKey, state)
-		e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "fallback agent exited without an answer"))
+		e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), e.i18n.T(MsgAgentFallbackNoAnswer)))
 		outcome.Failed = true
 		return
 	}

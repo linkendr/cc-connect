@@ -565,6 +565,8 @@ const (
 	MsgAgentFallbackOverloaded MsgKey = "agent_fallback_overloaded"
 	MsgAgentFallbackFailed     MsgKey = "agent_fallback_failed"
 	MsgAgentFallbackBlocked    MsgKey = "agent_fallback_blocked"
+	MsgAgentFallbackNoAnswer   MsgKey = "agent_fallback_no_answer"
+	MsgAgentFallbackAllFailed  MsgKey = "agent_fallback_all_failed"
 
 	MsgWhoamiTitle     MsgKey = "whoami_title"
 	MsgWhoamiCardTitle MsgKey = "whoami_card_title"
@@ -3490,6 +3492,20 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "%s 用量上限持續到 %s，改由 %s 回答",
 		LangJapanese:           "%s は %s まで利用上限です。%s で回答します",
 		LangSpanish:            "%s está en su límite de uso hasta %s; responde %s",
+	},
+	MsgAgentFallbackNoAnswer: {
+		LangEnglish:            "fallback agent exited without an answer",
+		LangChinese:            "备用 agent 退出且没有给出回答",
+		LangTraditionalChinese: "備用 agent 結束且沒有給出回答",
+		LangJapanese:           "フォールバック agent が回答なしで終了しました",
+		LangSpanish:            "el agente de respaldo terminó sin dar respuesta",
+	},
+	MsgAgentFallbackAllFailed: {
+		LangEnglish:            "all fallback agents failed",
+		LangChinese:            "所有备用 agent 均失败",
+		LangTraditionalChinese: "所有備用 agent 均失敗",
+		LangJapanese:           "すべてのフォールバック agent が失敗しました",
+		LangSpanish:            "todos los agentes de respaldo fallaron",
 	},
 	MsgPsSent: {
 		LangEnglish:            "✅ P.S. delivered.",

@@ -634,7 +634,7 @@ func (e *Engine) answerWithFallbacks(guard fallbackGuard, cause turnOutcome) {
 	// failed to build or start, or the last one could not start).
 	msg := cause.ErrText
 	if msg == "" {
-		msg = "all fallback agents failed"
+		msg = e.i18n.T(MsgAgentFallbackAllFailed)
 	}
 	e.send(in.platform, in.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), msg))
 }
