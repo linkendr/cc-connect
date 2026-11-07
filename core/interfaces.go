@@ -47,6 +47,12 @@ type Platform interface {
 // ErrNotSupported indicates a platform doesn't support a particular operation.
 var ErrNotSupported = errors.New("operation not supported by this platform")
 
+// ErrAgentExitedWithoutOutput is wrapped by an agent adapter's EventError when
+// the agent process failed without saying anything (the adapter keeps the exit
+// detail in the wrapped text for logs). The engine shows the user the
+// translated MsgAgentExitedWithoutOutput instead of the English text.
+var ErrAgentExitedWithoutOutput = errors.New("agent exited without output")
+
 // ReplyContextReconstructor is an optional interface for platforms that can
 // recreate a reply context from a session key. This is needed for cron jobs
 // to send messages to users without an incoming message.

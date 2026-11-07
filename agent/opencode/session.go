@@ -410,7 +410,7 @@ func (s *opencodeSession) readLoop(cmd *exec.Cmd, proc *opencodeProc, stderrBuf 
 		// successful result. Unclassified = provider-side for the agent
 		// fallback chain.
 		slog.Error("opencodeSession: process exited without output", "error", turnErr)
-		evt := core.Event{Type: core.EventError, Error: fmt.Errorf("opencode exited without output: %v", turnErr)}
+		evt := core.Event{Type: core.EventError, Error: fmt.Errorf("opencode: %w: %v", core.ErrAgentExitedWithoutOutput, turnErr)}
 		select {
 		case s.events <- evt:
 		case <-s.ctx.Done():

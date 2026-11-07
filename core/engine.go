@@ -5622,6 +5622,15 @@ type agentErrorHandler struct {
 	msgKey   MsgKey
 }
 
+// agentErrorText is the text of an agent error for the user: a known
+// generated diagnostic is translated, any other error keeps its own text.
+func (e *Engine) agentErrorText(err error) string {
+	if errors.Is(err, ErrAgentExitedWithoutOutput) {
+		return e.i18n.T(MsgAgentExitedWithoutOutput)
+	}
+	return err.Error()
+}
+
 var agentErrorHandlers = []agentErrorHandler{
 	{"Session not found", MsgSessionNotFound},
 }
@@ -7113,7 +7122,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				state.mu.Unlock()
 				errText := ""
 				if event.Error != nil {
-					errText = event.Error.Error()
+					errText = e.agentErrorText(event.Error)
 				}
 				return interceptTurn(event.ErrorKind, event.ErrorResetAt, errText)
 			}
@@ -7152,7 +7161,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					Platform:   p.Name(),
 					Error:      event.Error.Error(),
 				})
-				userMsg := fmt.Sprintf(e.i18n.T(MsgError), errMsg)
+				userMsg := fmt.Sprintf(e.i18n.T(MsgError), e.agentErrorText(event.Error))
 				for _, h := range agentErrorHandlers {
 					if strings.Contains(errMsg, h.contains) {
 						userMsg = e.i18n.T(h.msgKey)

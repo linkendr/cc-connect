@@ -2086,6 +2086,37 @@ func TestAgentFallback_SilentCrashErrorAdvances(t *testing.T) {
 	}
 }
 
+// The adapter's "exited without output" error reaches the user translated in
+// every language, never as the English adapter text.
+func TestAgentFallback_ExitedWithoutOutputErrorIsTranslated(t *testing.T) {
+	err := fmt.Errorf("opencode: %w: exit status 1", ErrAgentExitedWithoutOutput)
+	for _, lang := range []Language{LangEnglish, LangChinese, LangTraditionalChinese, LangJapanese, LangSpanish} {
+		e := &Engine{i18n: NewI18n(lang)}
+		want := NewI18n(lang).T(MsgAgentExitedWithoutOutput)
+		if got := e.agentErrorText(err); got != want || want == string(MsgAgentExitedWithoutOutput) {
+			t.Errorf("lang %q: agentErrorText = %q, want %q", lang, got, want)
+		}
+		if lang != LangEnglish && want == NewI18n(LangEnglish).T(MsgAgentExitedWithoutOutput) {
+			t.Errorf("lang %q has no translation for MsgAgentExitedWithoutOutput", lang)
+		}
+	}
+	if got := (&Engine{i18n: NewI18n(LangChinese)}).agentErrorText(errors.New("plain")); got != "plain" {
+		t.Errorf("other errors must keep their text, got %q", got)
+	}
+
+	env := newFallbackEnv(t,
+		[]scriptedTurn{usageLimitTurn(time.Time{})},
+		[]scriptedTurn{{{Type: EventError, Error: err}}},
+	)
+	env.e.i18n.SetLang(LangChinese)
+	env.send("question")
+	zh := NewI18n(LangChinese).T(MsgAgentExitedWithoutOutput)
+	env.waitSent(zh)
+	if env.sentContaining("exited without output") != 0 {
+		t.Errorf("English adapter text leaked: %#v", env.p.getSent())
+	}
+}
+
 // ---------- review round 7 ----------
 
 // R7-1: a successful fallback turn retires its session too: B never takes

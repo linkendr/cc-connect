@@ -560,16 +560,17 @@ const (
 
 	// Agent fallback chain notices (see agent_fallback.go). Distinct from
 	// MsgRateLimited, which is cc-connect's own inbound throttle.
-	MsgAgentFallbackUsageLimit MsgKey = "agent_fallback_usage_limit"
-	MsgAgentFallbackRateLimit  MsgKey = "agent_fallback_rate_limit"
-	MsgAgentFallbackOverloaded MsgKey = "agent_fallback_overloaded"
-	MsgAgentFallbackFailed     MsgKey = "agent_fallback_failed"
-	MsgAgentFallbackBlocked    MsgKey = "agent_fallback_blocked"
-	MsgAgentFallbackNoAnswer   MsgKey = "agent_fallback_no_answer"
-	MsgAgentFallbackAllFailed  MsgKey = "agent_fallback_all_failed"
-	MsgAgentFallbackStartFail  MsgKey = "agent_fallback_start_fail"
-	MsgSessionReset            MsgKey = "session_reset"
-	MsgAgentProcessExited      MsgKey = "agent_process_exited"
+	MsgAgentFallbackUsageLimit  MsgKey = "agent_fallback_usage_limit"
+	MsgAgentFallbackRateLimit   MsgKey = "agent_fallback_rate_limit"
+	MsgAgentFallbackOverloaded  MsgKey = "agent_fallback_overloaded"
+	MsgAgentFallbackFailed      MsgKey = "agent_fallback_failed"
+	MsgAgentFallbackBlocked     MsgKey = "agent_fallback_blocked"
+	MsgAgentFallbackNoAnswer    MsgKey = "agent_fallback_no_answer"
+	MsgAgentFallbackAllFailed   MsgKey = "agent_fallback_all_failed"
+	MsgAgentFallbackStartFail   MsgKey = "agent_fallback_start_fail"
+	MsgSessionReset             MsgKey = "session_reset"
+	MsgAgentProcessExited       MsgKey = "agent_process_exited"
+	MsgAgentExitedWithoutOutput MsgKey = "agent_exited_without_output"
 
 	MsgWhoamiTitle     MsgKey = "whoami_title"
 	MsgWhoamiCardTitle MsgKey = "whoami_card_title"
@@ -3516,6 +3517,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "會話已重置",
 		LangJapanese:           "セッションがリセットされました",
 		LangSpanish:            "sesión reiniciada",
+	},
+	MsgAgentExitedWithoutOutput: {
+		LangEnglish:            "the agent exited without any output",
+		LangChinese:            "Agent 退出且没有任何输出",
+		LangTraditionalChinese: "Agent 結束且沒有任何輸出",
+		LangJapanese:           "Agent が出力なしで終了しました",
+		LangSpanish:            "el agente terminó sin ninguna salida",
 	},
 	MsgAgentProcessExited: {
 		LangEnglish:            "agent process exited",
