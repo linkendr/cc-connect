@@ -2171,6 +2171,40 @@ func TestAgentFallback_UnconfirmedCloseIsNotResumed(t *testing.T) {
 	}
 }
 
+// The close-timeout error of an agent adapter reaches the chat translated in
+// every language (the close-failure alert appends the cause).
+func TestAgentFallback_CloseTimeoutAlertIsTranslated(t *testing.T) {
+	cause := fmt.Errorf("opencode: read loop did not exit within 8s: %w", ErrAgentCloseTimeout)
+	for _, lang := range []Language{LangEnglish, LangChinese, LangTraditionalChinese, LangJapanese, LangSpanish} {
+		env := newFallbackEnv(t, []scriptedTurn{okTurn("unused")})
+		env.e.i18n.SetLang(lang)
+		env.e.notifySessionCloseFailure(fallbackTestKey, env.p, "ctx", cause)
+		want := NewI18n(lang).T(MsgAgentCloseTimeout)
+		if lang != LangEnglish && want == NewI18n(LangEnglish).T(MsgAgentCloseTimeout) {
+			t.Errorf("lang %q has no translation for MsgAgentCloseTimeout", lang)
+		}
+		if env.sentContaining(want) != 1 || env.sentContaining("read loop") != 0 {
+			t.Errorf("lang %q: alert = %#v, want the translated cause %q and no adapter text", lang, env.p.getSent(), want)
+		}
+	}
+}
+
+// A process start failure of an adapter is shown translated, the OS detail is
+// not sent to the chat.
+func TestAgentErrorText_ProcessStartFailureIsTranslated(t *testing.T) {
+	err := fmt.Errorf("opencodeSession: start: %w: %w", ErrAgentProcessStart, errors.New("fork/exec opencode: no such file"))
+	for _, lang := range []Language{LangEnglish, LangChinese, LangTraditionalChinese, LangJapanese, LangSpanish} {
+		e := &Engine{i18n: NewI18n(lang)}
+		want := NewI18n(lang).T(MsgAgentProcessStartFailed)
+		if got := e.agentErrorText(err); got != want || want == string(MsgAgentProcessStartFailed) {
+			t.Errorf("lang %q: agentErrorText = %q, want %q", lang, got, want)
+		}
+		if lang != LangEnglish && want == NewI18n(LangEnglish).T(MsgAgentProcessStartFailed) {
+			t.Errorf("lang %q has no translation for MsgAgentProcessStartFailed", lang)
+		}
+	}
+}
+
 // R7-2: the user's "allow" claims the permission before answering; a
 // shutdown during the user's reply does not answer it again.
 func TestAgentFallback_PermissionAnsweredOnce(t *testing.T) {

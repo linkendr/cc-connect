@@ -53,6 +53,16 @@ var ErrNotSupported = errors.New("operation not supported by this platform")
 // translated MsgAgentExitedWithoutOutput instead of the English text.
 var ErrAgentExitedWithoutOutput = errors.New("agent exited without output")
 
+// ErrAgentCloseTimeout is wrapped by an agent adapter's Close error when the
+// agent's reader did not stop in time. The engine shows the user the translated
+// MsgAgentCloseTimeout; the adapter keeps the detail for logs.
+var ErrAgentCloseTimeout = errors.New("agent close timed out")
+
+// ErrAgentProcessStart is wrapped by an agent adapter's Send error when it could
+// not set up or start the agent process (pipes, exec). The engine shows the
+// user the translated MsgAgentProcessStartFailed; the OS detail stays in logs.
+var ErrAgentProcessStart = errors.New("agent process could not be started")
+
 // ReplyContextReconstructor is an optional interface for platforms that can
 // recreate a reply context from a session key. This is needed for cron jobs
 // to send messages to users without an incoming message.

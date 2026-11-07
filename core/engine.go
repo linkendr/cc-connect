@@ -5111,7 +5111,7 @@ func (e *Engine) notifySessionCloseFailure(sessionKey string, platform Platform,
 			"session", sessionKey, "cause", cause)
 		return
 	}
-	text := e.i18n.T(MsgSessionCloseFailed) + fmt.Sprintf(" (%v)", cause)
+	text := e.i18n.T(MsgSessionCloseFailed) + fmt.Sprintf(" (%s)", e.agentErrorText(cause))
 	if err := e.waitOutgoing(platform); err != nil {
 		slog.Warn("notifySessionCloseFailure: wait outgoing failed", "session", sessionKey, "error", err)
 	}
@@ -5625,8 +5625,17 @@ type agentErrorHandler struct {
 // agentErrorText is the text of an agent error for the user: a known
 // generated diagnostic is translated, any other error keeps its own text.
 func (e *Engine) agentErrorText(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, ErrAgentProcessStart) {
+		return e.i18n.T(MsgAgentProcessStartFailed)
+	}
 	if errors.Is(err, ErrAgentExitedWithoutOutput) {
 		return e.i18n.T(MsgAgentExitedWithoutOutput)
+	}
+	if errors.Is(err, ErrAgentCloseTimeout) {
+		return e.i18n.T(MsgAgentCloseTimeout)
 	}
 	return err.Error()
 }
@@ -5793,7 +5802,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				return
 			}
 			if err != nil && intercept == interceptAnyError {
-				return interceptTurn(ErrorKindUnknown, time.Time{}, err.Error())
+				return interceptTurn(ErrorKindUnknown, time.Time{}, e.agentErrorText(err))
 			}
 			if err != nil {
 				slog.Error("failed to send prompt", "error", err, "session_key", sessionKey)
@@ -5809,7 +5818,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				state.mu.Lock()
 				p := state.platform
 				state.mu.Unlock()
-				e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
+				e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), e.agentErrorText(err)))
 				outcome.Failed = true
 				return
 			}
@@ -7326,7 +7335,7 @@ func (e *Engine) notifyDroppedQueuedMessages(state *interactiveState, reason err
 	state.pendingMessages = nil
 	state.mu.Unlock()
 	for _, q := range remaining {
-		e.send(q.platform, q.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), reason))
+		e.send(q.platform, q.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), e.agentErrorText(reason)))
 	}
 }
 

@@ -569,6 +569,8 @@ const (
 	MsgAgentFallbackAllFailed   MsgKey = "agent_fallback_all_failed"
 	MsgAgentFallbackStartFail   MsgKey = "agent_fallback_start_fail"
 	MsgSessionReset             MsgKey = "session_reset"
+	MsgAgentCloseTimeout        MsgKey = "agent_close_timeout"
+	MsgAgentProcessStartFailed  MsgKey = "agent_process_start_failed"
 	MsgAgentProcessExited       MsgKey = "agent_process_exited"
 	MsgAgentExitedWithoutOutput MsgKey = "agent_exited_without_output"
 
@@ -3524,6 +3526,20 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "Agent 結束且沒有任何輸出",
 		LangJapanese:           "Agent が出力なしで終了しました",
 		LangSpanish:            "el agente terminó sin ninguna salida",
+	},
+	MsgAgentCloseTimeout: {
+		LangEnglish:            "the agent did not stop in time",
+		LangChinese:            "Agent 未能及时停止",
+		LangTraditionalChinese: "Agent 未能及時停止",
+		LangJapanese:           "Agent が時間内に停止しませんでした",
+		LangSpanish:            "el agente no se detuvo a tiempo",
+	},
+	MsgAgentProcessStartFailed: {
+		LangEnglish:            "the agent process could not be started",
+		LangChinese:            "无法启动 Agent 进程",
+		LangTraditionalChinese: "無法啟動 Agent 程序",
+		LangJapanese:           "Agent プロセスを起動できませんでした",
+		LangSpanish:            "no se pudo iniciar el proceso del agente",
 	},
 	MsgAgentProcessExited: {
 		LangEnglish:            "agent process exited",
