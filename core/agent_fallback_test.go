@@ -640,7 +640,7 @@ func TestFormatResetTime(t *testing.T) {
 		t.Errorf("same day = %q", got)
 	}
 	later := time.Date(2026, 10, 20, 9, 30, 0, 0, time.Local)
-	if got, want := formatResetTime(later, now), later.Format("Jan 2 15:04 MST"); got != want {
+	if got, want := formatResetTime(later, now), later.Format("01-02 15:04 MST"); got != want {
 		t.Errorf("other day = %q, want %q", got, want)
 	}
 }
@@ -1077,6 +1077,54 @@ func TestAgentFallback_StopBeforeDeadPrimaryRestart(t *testing.T) {
 	}
 	if env.sentContaining("session reset") != 1 {
 		t.Errorf("stopped queued message not reported; sent = %#v", env.p.getSent())
+	}
+}
+
+// The two "session reset" replies of the queue drain are translated: with a
+// Chinese engine the user sees the Chinese text, never the English literal.
+func TestAgentFallback_SessionResetReplyIsTranslated(t *testing.T) {
+	zhReset := NewI18n(LangChinese).T(MsgSessionReset)
+	if zhReset == "session reset" || zhReset == string(MsgSessionReset) {
+		t.Fatalf("MsgSessionReset has no Chinese translation: %q", zhReset)
+	}
+	for name, setup := range map[string]func(env *fallbackEnv, st *interactiveState, session *Session, dead *scriptedSession){
+		"stop before restart": func(env *fallbackEnv, st *interactiveState, session *Session, dead *scriptedSession) {
+			env.e.agentFallback.mu.Lock()
+			env.e.agentFallback.blockedUntil = env.now.Add(-time.Minute)
+			env.e.agentFallback.mu.Unlock()
+			var once sync.Once
+			env.e.agentFallback.now = func() time.Time {
+				once.Do(func() { env.e.stopInteractiveSession(fallbackTestKey, env.p, "ctx") })
+				return env.now
+			}
+		},
+		"stop during restart": func(env *fallbackEnv, st *interactiveState, session *Session, dead *scriptedSession) {
+			env.primary.onStart = func() {
+				st.markStopped()
+				session.ForceUnlock()
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			env := newFallbackEnv(t, nil, []scriptedTurn{okTurn("unused")})
+			env.e.i18n.SetLang(LangChinese)
+			dead := newScriptedSession("dead-sid")
+			dead.dead = true
+			env.primary.session = dead
+			env.primary.more = []*scriptedSession{newScriptedSession("fresh-sid", okTurn("must not run"))}
+			env.primary.starts = 1
+			st, session, gen := env.drainFixture(dead, true)
+			setup(env, st, session, dead)
+
+			env.e.drainPendingMessages(st, session, env.e.sessions, fallbackTestKey, gen)
+
+			if env.sentContaining(zhReset) != 1 {
+				t.Errorf("reset reply not translated; want %q in %#v", zhReset, env.p.getSent())
+			}
+			if env.sentContaining("session reset") != 0 {
+				t.Errorf("English literal leaked: %#v", env.p.getSent())
+			}
+		})
 	}
 }
 
@@ -2038,6 +2086,37 @@ func TestAgentFallback_SilentCrashErrorAdvances(t *testing.T) {
 	}
 }
 
+// The adapter's "exited without output" error reaches the user translated in
+// every language, never as the English adapter text.
+func TestAgentFallback_ExitedWithoutOutputErrorIsTranslated(t *testing.T) {
+	err := fmt.Errorf("opencode: %w: exit status 1", ErrAgentExitedWithoutOutput)
+	for _, lang := range []Language{LangEnglish, LangChinese, LangTraditionalChinese, LangJapanese, LangSpanish} {
+		e := &Engine{i18n: NewI18n(lang)}
+		want := NewI18n(lang).T(MsgAgentExitedWithoutOutput)
+		if got := e.agentErrorText(err); got != want || want == string(MsgAgentExitedWithoutOutput) {
+			t.Errorf("lang %q: agentErrorText = %q, want %q", lang, got, want)
+		}
+		if lang != LangEnglish && want == NewI18n(LangEnglish).T(MsgAgentExitedWithoutOutput) {
+			t.Errorf("lang %q has no translation for MsgAgentExitedWithoutOutput", lang)
+		}
+	}
+	if got := (&Engine{i18n: NewI18n(LangChinese)}).agentErrorText(errors.New("plain")); got != "plain" {
+		t.Errorf("other errors must keep their text, got %q", got)
+	}
+
+	env := newFallbackEnv(t,
+		[]scriptedTurn{usageLimitTurn(time.Time{})},
+		[]scriptedTurn{{{Type: EventError, Error: err}}},
+	)
+	env.e.i18n.SetLang(LangChinese)
+	env.send("question")
+	zh := NewI18n(LangChinese).T(MsgAgentExitedWithoutOutput)
+	env.waitSent(zh)
+	if env.sentContaining("exited without output") != 0 {
+		t.Errorf("English adapter text leaked: %#v", env.p.getSent())
+	}
+}
+
 // ---------- review round 7 ----------
 
 // R7-1: a successful fallback turn retires its session too: B never takes
@@ -2089,6 +2168,40 @@ func TestAgentFallback_UnconfirmedCloseIsNotResumed(t *testing.T) {
 	env.fbs[0].mu.Unlock()
 	if len(ids) != 2 || ids[1] != "" {
 		t.Errorf("start resume IDs = %q, want a fresh second start (\"\")", ids)
+	}
+}
+
+// The close-timeout error of an agent adapter reaches the chat translated in
+// every language (the close-failure alert appends the cause).
+func TestAgentFallback_CloseTimeoutAlertIsTranslated(t *testing.T) {
+	cause := fmt.Errorf("opencode: read loop did not exit within 8s: %w", ErrAgentCloseTimeout)
+	for _, lang := range []Language{LangEnglish, LangChinese, LangTraditionalChinese, LangJapanese, LangSpanish} {
+		env := newFallbackEnv(t, []scriptedTurn{okTurn("unused")})
+		env.e.i18n.SetLang(lang)
+		env.e.notifySessionCloseFailure(fallbackTestKey, env.p, "ctx", cause)
+		want := NewI18n(lang).T(MsgAgentCloseTimeout)
+		if lang != LangEnglish && want == NewI18n(LangEnglish).T(MsgAgentCloseTimeout) {
+			t.Errorf("lang %q has no translation for MsgAgentCloseTimeout", lang)
+		}
+		if env.sentContaining(want) != 1 || env.sentContaining("read loop") != 0 {
+			t.Errorf("lang %q: alert = %#v, want the translated cause %q and no adapter text", lang, env.p.getSent(), want)
+		}
+	}
+}
+
+// A process start failure of an adapter is shown translated, the OS detail is
+// not sent to the chat.
+func TestAgentErrorText_ProcessStartFailureIsTranslated(t *testing.T) {
+	err := fmt.Errorf("opencodeSession: start: %w: %w", ErrAgentProcessStart, errors.New("fork/exec opencode: no such file"))
+	for _, lang := range []Language{LangEnglish, LangChinese, LangTraditionalChinese, LangJapanese, LangSpanish} {
+		e := &Engine{i18n: NewI18n(lang)}
+		want := NewI18n(lang).T(MsgAgentProcessStartFailed)
+		if got := e.agentErrorText(err); got != want || want == string(MsgAgentProcessStartFailed) {
+			t.Errorf("lang %q: agentErrorText = %q, want %q", lang, got, want)
+		}
+		if lang != LangEnglish && want == NewI18n(LangEnglish).T(MsgAgentProcessStartFailed) {
+			t.Errorf("lang %q has no translation for MsgAgentProcessStartFailed", lang)
+		}
 	}
 }
 

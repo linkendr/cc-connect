@@ -5111,7 +5111,7 @@ func (e *Engine) notifySessionCloseFailure(sessionKey string, platform Platform,
 			"session", sessionKey, "cause", cause)
 		return
 	}
-	text := e.i18n.T(MsgSessionCloseFailed) + fmt.Sprintf(" (%v)", cause)
+	text := e.i18n.T(MsgSessionCloseFailed) + fmt.Sprintf(" (%s)", e.agentErrorText(cause))
 	if err := e.waitOutgoing(platform); err != nil {
 		slog.Warn("notifySessionCloseFailure: wait outgoing failed", "session", sessionKey, "error", err)
 	}
@@ -5622,6 +5622,24 @@ type agentErrorHandler struct {
 	msgKey   MsgKey
 }
 
+// agentErrorText is the text of an agent error for the user: a known
+// generated diagnostic is translated, any other error keeps its own text.
+func (e *Engine) agentErrorText(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, ErrAgentProcessStart) {
+		return e.i18n.T(MsgAgentProcessStartFailed)
+	}
+	if errors.Is(err, ErrAgentExitedWithoutOutput) {
+		return e.i18n.T(MsgAgentExitedWithoutOutput)
+	}
+	if errors.Is(err, ErrAgentCloseTimeout) {
+		return e.i18n.T(MsgAgentCloseTimeout)
+	}
+	return err.Error()
+}
+
 var agentErrorHandlers = []agentErrorHandler{
 	{"Session not found", MsgSessionNotFound},
 }
@@ -5784,7 +5802,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				return
 			}
 			if err != nil && intercept == interceptAnyError {
-				return interceptTurn(ErrorKindUnknown, time.Time{}, err.Error())
+				return interceptTurn(ErrorKindUnknown, time.Time{}, e.agentErrorText(err))
 			}
 			if err != nil {
 				slog.Error("failed to send prompt", "error", err, "session_key", sessionKey)
@@ -5800,7 +5818,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				state.mu.Lock()
 				p := state.platform
 				state.mu.Unlock()
-				e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
+				e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), e.agentErrorText(err)))
 				outcome.Failed = true
 				return
 			}
@@ -7113,7 +7131,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				state.mu.Unlock()
 				errText := ""
 				if event.Error != nil {
-					errText = event.Error.Error()
+					errText = e.agentErrorText(event.Error)
 				}
 				return interceptTurn(event.ErrorKind, event.ErrorResetAt, errText)
 			}
@@ -7152,7 +7170,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					Platform:   p.Name(),
 					Error:      event.Error.Error(),
 				})
-				userMsg := fmt.Sprintf(e.i18n.T(MsgError), errMsg)
+				userMsg := fmt.Sprintf(e.i18n.T(MsgError), e.agentErrorText(event.Error))
 				for _, h := range agentErrorHandlers {
 					if strings.Contains(errMsg, h.contains) {
 						userMsg = e.i18n.T(h.msgKey)
@@ -7181,7 +7199,7 @@ channelClosed:
 		state.eventsNeedResync = true
 		state.mu.Unlock()
 		e.cleanupInteractiveState(sessionKey, state)
-		return interceptTurn(ErrorKindUnknown, time.Time{}, "agent process exited")
+		return interceptTurn(ErrorKindUnknown, time.Time{}, e.i18n.T(MsgAgentProcessExited))
 	}
 	if isFallbackState && len(textParts) == 0 && !state.isStopped() {
 		// The last fallback agent exited without an answer or an error
@@ -7193,7 +7211,7 @@ channelClosed:
 		p := state.platform
 		state.mu.Unlock()
 		e.cleanupInteractiveState(sessionKey, state)
-		e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "fallback agent exited without an answer"))
+		e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), e.i18n.T(MsgAgentFallbackNoAnswer)))
 		outcome.Failed = true
 		return
 	}
@@ -7317,7 +7335,7 @@ func (e *Engine) notifyDroppedQueuedMessages(state *interactiveState, reason err
 	state.pendingMessages = nil
 	state.mu.Unlock()
 	for _, q := range remaining {
-		e.send(q.platform, q.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), reason))
+		e.send(q.platform, q.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), e.agentErrorText(reason)))
 	}
 }
 
@@ -7401,7 +7419,7 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 			return !st.isStopped() && session.HoldsLock(lockGen)
 		}
 		if fallbackDrain && !turnLive(state) {
-			e.send(queued.platform, queued.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "session reset"))
+			e.send(queued.platform, queued.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), e.i18n.T(MsgSessionReset)))
 			return false
 		}
 		if fallbackDrain && (as == nil || !as.Alive()) {
@@ -7413,7 +7431,7 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 			if !turnLive(state) {
 				// /stop ran while the primary was starting: this turn is
 				// gone, and the state may belong to a newer turn.
-				e.send(queued.platform, queued.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "session reset"))
+				e.send(queued.platform, queued.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), e.i18n.T(MsgSessionReset)))
 				return false
 			}
 			restarted.mu.Lock()
