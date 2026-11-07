@@ -567,6 +567,9 @@ const (
 	MsgAgentFallbackBlocked    MsgKey = "agent_fallback_blocked"
 	MsgAgentFallbackNoAnswer   MsgKey = "agent_fallback_no_answer"
 	MsgAgentFallbackAllFailed  MsgKey = "agent_fallback_all_failed"
+	MsgAgentFallbackStartFail  MsgKey = "agent_fallback_start_fail"
+	MsgSessionReset            MsgKey = "session_reset"
+	MsgAgentProcessExited      MsgKey = "agent_process_exited"
 
 	MsgWhoamiTitle     MsgKey = "whoami_title"
 	MsgWhoamiCardTitle MsgKey = "whoami_card_title"
@@ -3499,6 +3502,27 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "備用 agent 結束且沒有給出回答",
 		LangJapanese:           "フォールバック agent が回答なしで終了しました",
 		LangSpanish:            "el agente de respaldo terminó sin dar respuesta",
+	},
+	MsgAgentFallbackStartFail: {
+		LangEnglish:            "fallback agent could not be started",
+		LangChinese:            "备用 agent 无法启动",
+		LangTraditionalChinese: "備用 agent 無法啟動",
+		LangJapanese:           "フォールバック agent を起動できませんでした",
+		LangSpanish:            "no se pudo iniciar el agente de respaldo",
+	},
+	MsgSessionReset: {
+		LangEnglish:            "session reset",
+		LangChinese:            "会话已重置",
+		LangTraditionalChinese: "會話已重置",
+		LangJapanese:           "セッションがリセットされました",
+		LangSpanish:            "sesión reiniciada",
+	},
+	MsgAgentProcessExited: {
+		LangEnglish:            "agent process exited",
+		LangChinese:            "Agent 进程已退出",
+		LangTraditionalChinese: "Agent 程序已結束",
+		LangJapanese:           "Agent プロセスが終了しました",
+		LangSpanish:            "el proceso del agente terminó",
 	},
 	MsgAgentFallbackAllFailed: {
 		LangEnglish:            "all fallback agents failed",

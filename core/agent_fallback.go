@@ -574,13 +574,13 @@ func (e *Engine) fallbackNotice(failed string, cause turnOutcome, next string) s
 }
 
 // formatResetTime renders a reset time in local time: "15:04 MST" today,
-// "Jan 2 15:04 MST" on another day.
+// "01-02 15:04 MST" on another day (numeric, so it needs no month names).
 func formatResetTime(t, now time.Time) string {
 	lt, ln := t.Local(), now.Local()
 	if lt.Year() == ln.Year() && lt.YearDay() == ln.YearDay() {
 		return lt.Format("15:04 MST")
 	}
-	return lt.Format("Jan 2 15:04 MST")
+	return lt.Format("01-02 15:04 MST")
 }
 
 // answerWithFallbacks answers cause.Input with the fallback chain after the
@@ -608,7 +608,7 @@ func (e *Engine) answerWithFallbacks(guard fallbackGuard, cause turnOutcome) {
 		agent, fbSessions, err := chain.agentAt(i)
 		if err != nil {
 			slog.Error("agent fallback: cannot build fallback agent", "index", i, "error", err)
-			cause = turnOutcome{Intercepted: true, ErrText: err.Error(), Input: in}
+			cause = turnOutcome{Intercepted: true, ErrText: e.i18n.T(MsgAgentFallbackStartFail), Input: in}
 			continue
 		}
 		label := chain.label(i, agent)

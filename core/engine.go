@@ -7181,7 +7181,7 @@ channelClosed:
 		state.eventsNeedResync = true
 		state.mu.Unlock()
 		e.cleanupInteractiveState(sessionKey, state)
-		return interceptTurn(ErrorKindUnknown, time.Time{}, "agent process exited")
+		return interceptTurn(ErrorKindUnknown, time.Time{}, e.i18n.T(MsgAgentProcessExited))
 	}
 	if isFallbackState && len(textParts) == 0 && !state.isStopped() {
 		// The last fallback agent exited without an answer or an error
@@ -7401,7 +7401,7 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 			return !st.isStopped() && session.HoldsLock(lockGen)
 		}
 		if fallbackDrain && !turnLive(state) {
-			e.send(queued.platform, queued.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "session reset"))
+			e.send(queued.platform, queued.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), e.i18n.T(MsgSessionReset)))
 			return false
 		}
 		if fallbackDrain && (as == nil || !as.Alive()) {
@@ -7413,7 +7413,7 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 			if !turnLive(state) {
 				// /stop ran while the primary was starting: this turn is
 				// gone, and the state may belong to a newer turn.
-				e.send(queued.platform, queued.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "session reset"))
+				e.send(queued.platform, queued.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), e.i18n.T(MsgSessionReset)))
 				return false
 			}
 			restarted.mu.Lock()

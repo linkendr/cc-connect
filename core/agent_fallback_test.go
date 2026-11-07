@@ -640,7 +640,7 @@ func TestFormatResetTime(t *testing.T) {
 		t.Errorf("same day = %q", got)
 	}
 	later := time.Date(2026, 10, 20, 9, 30, 0, 0, time.Local)
-	if got, want := formatResetTime(later, now), later.Format("Jan 2 15:04 MST"); got != want {
+	if got, want := formatResetTime(later, now), later.Format("01-02 15:04 MST"); got != want {
 		t.Errorf("other day = %q, want %q", got, want)
 	}
 }
@@ -1077,6 +1077,54 @@ func TestAgentFallback_StopBeforeDeadPrimaryRestart(t *testing.T) {
 	}
 	if env.sentContaining("session reset") != 1 {
 		t.Errorf("stopped queued message not reported; sent = %#v", env.p.getSent())
+	}
+}
+
+// The two "session reset" replies of the queue drain are translated: with a
+// Chinese engine the user sees the Chinese text, never the English literal.
+func TestAgentFallback_SessionResetReplyIsTranslated(t *testing.T) {
+	zhReset := NewI18n(LangChinese).T(MsgSessionReset)
+	if zhReset == "session reset" || zhReset == string(MsgSessionReset) {
+		t.Fatalf("MsgSessionReset has no Chinese translation: %q", zhReset)
+	}
+	for name, setup := range map[string]func(env *fallbackEnv, st *interactiveState, session *Session, dead *scriptedSession){
+		"stop before restart": func(env *fallbackEnv, st *interactiveState, session *Session, dead *scriptedSession) {
+			env.e.agentFallback.mu.Lock()
+			env.e.agentFallback.blockedUntil = env.now.Add(-time.Minute)
+			env.e.agentFallback.mu.Unlock()
+			var once sync.Once
+			env.e.agentFallback.now = func() time.Time {
+				once.Do(func() { env.e.stopInteractiveSession(fallbackTestKey, env.p, "ctx") })
+				return env.now
+			}
+		},
+		"stop during restart": func(env *fallbackEnv, st *interactiveState, session *Session, dead *scriptedSession) {
+			env.primary.onStart = func() {
+				st.markStopped()
+				session.ForceUnlock()
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			env := newFallbackEnv(t, nil, []scriptedTurn{okTurn("unused")})
+			env.e.i18n.SetLang(LangChinese)
+			dead := newScriptedSession("dead-sid")
+			dead.dead = true
+			env.primary.session = dead
+			env.primary.more = []*scriptedSession{newScriptedSession("fresh-sid", okTurn("must not run"))}
+			env.primary.starts = 1
+			st, session, gen := env.drainFixture(dead, true)
+			setup(env, st, session, dead)
+
+			env.e.drainPendingMessages(st, session, env.e.sessions, fallbackTestKey, gen)
+
+			if env.sentContaining(zhReset) != 1 {
+				t.Errorf("reset reply not translated; want %q in %#v", zhReset, env.p.getSent())
+			}
+			if env.sentContaining("session reset") != 0 {
+				t.Errorf("English literal leaked: %#v", env.p.getSent())
+			}
+		})
 	}
 }
 
