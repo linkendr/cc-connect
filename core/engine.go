@@ -636,6 +636,11 @@ type interactiveState struct {
 	// that gate. Both unused without a fallback chain.
 	dispatchCh    chan struct{}
 	stopRequested atomic.Bool
+
+	// consumerDone is closed when the running foreground event consumer
+	// (processInteractiveEvents) returns; nil when none runs. A graceful
+	// /stop waits on it before another turn may read Events().
+	consumerDone chan struct{}
 }
 
 // dispatchGate returns the state's one-slot dispatch gate, creating it on
@@ -5691,6 +5696,19 @@ var agentErrorHandlers = []agentErrorHandler{
 // failure is not shown; the loop returns Intercepted=true with the failed
 // message so the caller can answer it with a fallback agent.
 func (e *Engine) processInteractiveEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, msgID string, turnStart time.Time, stopTypingFn func(), sendDone <-chan error, replyCtx any, lockGen uint64) (outcome turnOutcome) {
+	consumerDone := make(chan struct{})
+	state.mu.Lock()
+	state.consumerDone = consumerDone
+	state.mu.Unlock()
+	defer func() {
+		state.mu.Lock()
+		if state.consumerDone == consumerDone {
+			state.consumerDone = nil
+		}
+		state.mu.Unlock()
+		close(consumerDone)
+	}()
+
 	if msgID != "" {
 		state.mu.Lock()
 		state.currentMessageID = msgID
@@ -6541,7 +6559,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				)
 				continue
 			}
-			if intercept.catchesResult(event) {
+			// A /stop in progress keeps stopRequested raised until this
+			// consumer has returned: the stopped turn's result is not handed
+			// to the fallback chain, even with a retriable error.
+			if intercept.catchesResult(event) && !state.stopRequested.Load() {
 				// The turn failed at the API layer (e.g. Claude's usage cap);
 				// the process is alive and the turn is over. Keep tracking the
 				// agent session ID so the primary's --resume stays correct.
@@ -11534,6 +11555,10 @@ func (e *Engine) stopInteractiveSessionWithOptions(sessionKey string, notifyQueu
 // maxStopRetargets bounds how often /stop re-resolves a replaced state.
 const maxStopRetargets = 8
 
+// cancelHandoffTimeout bounds how long a graceful /stop waits for the
+// cancelled turn's event consumer to return before it closes the session.
+const cancelHandoffTimeout = 10 * time.Second
+
 // stopInteractiveSessionOnce stops the state registered for sessionKey.
 // With expect set, it only stops that object and reports retry=true when
 // the key maps to another state.
@@ -11568,6 +11593,7 @@ func (e *Engine) stopInteractiveSessionOnce(sessionKey string, notifyQueued bool
 	agentSession := state.agentSession
 	closePlatform := state.platform
 	closeReplyCtx := state.replyCtx
+	consumerDone := state.consumerDone
 	state.mu.Unlock()
 
 	// If the agent session supports graceful turn cancellation (e.g. ACP,
@@ -11624,14 +11650,25 @@ func (e *Engine) stopInteractiveSessionOnce(sessionKey string, notifyQueued bool
 			goto normalCleanup
 		}
 
-		// Release the busy lock: the turn is over, so the session must not stay
-		// locked against the next user message. Kept from the upstream (HEAD)
-		// side of the rebase.
-		if state.busySession != nil && state.busySession.ForceUnlock() {
+		// Hand the event stream over in order. A running consumer reads the
+		// cancelled turn's own terminal event and returns; its goroutine then
+		// releases the busy lock. Forcing the lock open here would let the
+		// next turn read Events() while the old consumer still does, and the
+		// old turn's late result would end the new turn. Only without a
+		// consumer is the lock forced open.
+		if consumerDone != nil {
+			select {
+			case <-consumerDone:
+			case <-time.After(cancelHandoffTimeout):
+				slog.Warn("cancelled turn's event consumer did not return, falling back to Close",
+					"session_key", sessionKey, "timeout", cancelHandoffTimeout)
+				e.interactiveMu.Lock()
+				goto normalCleanup
+			}
+		} else if state.busySession != nil && state.busySession.ForceUnlock() {
 			slog.Info("session busy lock released after turn cancel", "session_key", sessionKey)
 		}
-		// The state stays in use; the bumped lock generation now cancels
-		// any dispatch of the cancelled turn.
+		// The state stays in use for the next turn.
 		state.stopRequested.Store(false)
 
 		slog.Info("agent session turn cancelled, session kept alive",

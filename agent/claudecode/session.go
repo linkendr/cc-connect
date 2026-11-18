@@ -1300,11 +1300,12 @@ func (cs *claudeSession) handleResult(raw map[string]any) {
 		// A non-compaction result terminates the turn, whatever its subtype.
 		// `error_during_execution` is what the CLI emits for a turn ended by
 		// our own interrupt; `success` is a turn that completed on its own.
-		// Either way the turn is over, so release anything waiting on that fact.
-		// Signalled before the cs.events send below, which can block on a slow
-		// consumer — a blocked consumer must not delay the interrupt ack.
+		// The cancel waiters are woken only after the cs.events send below:
+		// CancelTurn returning nil means the terminal event is already in the
+		// stream, so the engine can drain it or let the old turn read it
+		// before the next turn starts. A consumer too slow to take it leaves
+		// CancelTurn to its timeout and the Close() fallback.
 		cs.turnActive.Store(false)
-		cs.signalTurnTerminated()
 	}
 
 	// Exact context size, in order of preference:
@@ -1412,6 +1413,9 @@ func (cs *claudeSession) handleResult(raw map[string]any) {
 	case cs.events <- evt:
 	case <-cs.ctx.Done():
 		return
+	}
+	if !isCompaction {
+		cs.signalTurnTerminated()
 	}
 }
 
