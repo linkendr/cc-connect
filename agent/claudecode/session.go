@@ -1817,9 +1817,16 @@ func (cs *claudeSession) Alive() bool {
 	return cs.alive.Load()
 }
 
-// CancelTurn implements core.AgentSessionCanceller. Asks Claude Code
-// to interrupt the current generation over the existing stream-json
-// stdin channel — `{"type":"control_request","request":{"subtype":
+// cancelTurn is upstream's CancelTurn, unexported in the fork so that
+// claudeSession does not implement core.AgentSessionCanceller. /stop then
+// takes the engine's close path: the state is marked stopped and removed, the
+// process is closed, and the next message starts a new process. With the
+// process kept across /stop, the stopped turn's late result could finish the
+// next turn, and its fallback could start after /stop returned
+// (linkendr/cc-connect PR 7 review).
+//
+// Upstream's description: asks Claude Code to interrupt the current
+// generation over the existing stream-json stdin channel — `{"type":"control_request","request":{"subtype":
 // "interrupt"}, "request_id": "..."}`. The CLI replies with a
 // `control_response`, emits a `result` event that terminates the turn
 // (subtype="error_during_execution"), and returns to its idle-waiting
@@ -1857,7 +1864,7 @@ func (cs *claudeSession) Alive() bool {
 //
 // 空闲 session（turnActive=false）直接返回 nil：没有 turn 可中断，也不会有
 // result 事件，不该白白等满超时。
-func (cs *claudeSession) CancelTurn() error {
+func (cs *claudeSession) cancelTurn() error {
 	cs.stdinMu.Lock()
 	stdinClosed := cs.stdin == nil
 	cs.stdinMu.Unlock()

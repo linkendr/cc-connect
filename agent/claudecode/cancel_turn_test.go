@@ -73,7 +73,7 @@ func TestCancelTurn_WritesInterruptRequest(t *testing.T) {
 	cs, stdin := newCancelTestSession(t, 50*time.Millisecond)
 	cs.turnActive.Store(true)
 
-	if err := cs.CancelTurn(); err == nil {
+	if err := cs.cancelTurn(); err == nil {
 		t.Fatal("CancelTurn returned nil; want the no-confirmation error")
 	}
 
@@ -110,7 +110,7 @@ func TestCancelTurn_ReturnsNilWhenResultConfirms(t *testing.T) {
 	cs.turnActive.Store(true)
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- cs.CancelTurn() }()
+	go func() { errCh <- cs.cancelTurn() }()
 
 	// CancelTurn must still be waiting — an unconfirmed cancel is not success.
 	select {
@@ -142,7 +142,7 @@ func TestCancelTurn_TimesOutWhenCLIEmitsNoResult(t *testing.T) {
 	cs.turnActive.Store(true)
 
 	start := time.Now()
-	err := cs.CancelTurn()
+	err := cs.cancelTurn()
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -165,7 +165,7 @@ func TestCancelTurn_IdleSessionReturnsImmediately(t *testing.T) {
 	// turnActive left false — the session has not sent a message.
 
 	done := make(chan error, 1)
-	go func() { done <- cs.CancelTurn() }()
+	go func() { done <- cs.cancelTurn() }()
 
 	select {
 	case err := <-done:
@@ -186,7 +186,7 @@ func TestCancelTurn_CompactionResultDoesNotConfirm(t *testing.T) {
 	cs.turnActive.Store(true)
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- cs.CancelTurn() }()
+	go func() { errCh <- cs.cancelTurn() }()
 
 	time.Sleep(50 * time.Millisecond)
 	cs.handleResult(map[string]any{
@@ -221,7 +221,7 @@ func TestCancelTurn_ProcessExitWhileWaiting(t *testing.T) {
 	cs.turnActive.Store(true)
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- cs.CancelTurn() }()
+	go func() { errCh <- cs.cancelTurn() }()
 
 	time.Sleep(50 * time.Millisecond)
 	close(cs.done)
@@ -355,7 +355,7 @@ func TestCancelTurn_ConcurrentCallsBothConfirm(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			errs[i] = cs.CancelTurn()
+			errs[i] = cs.cancelTurn()
 		}(i)
 	}
 
