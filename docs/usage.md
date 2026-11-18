@@ -908,7 +908,7 @@ Notes:
 
 ### `/stop` and `turn.cancelled`
 
-For agents that support graceful cancellation (Claude Code and ACP-based agents), `/stop` interrupts the current turn but keeps the agent process and the conversation alive, so `/compress`, `/clear`, and `/resume` keep working afterwards. A stop is therefore no longer necessarily a session end.
+For agents that support graceful cancellation (ACP-based agents), `/stop` interrupts the current turn but keeps the agent process and the conversation alive, so `/compress`, `/clear`, and `/resume` keep working afterwards. A stop is therefore no longer necessarily a session end. In this fork, Claude Code does not use graceful cancellation: `/stop` closes the Claude process, and the next message starts a new one.
 
 `stop_hook_event` selects which event `/stop` fires:
 

@@ -820,7 +820,7 @@ cc-connect send --tts "你好"
 
 ### `/stop` 与 `turn.cancelled`
 
-对于支持优雅取消的 Agent（Claude Code 与 ACP 系 Agent），`/stop` 只中断当前这一轮，Agent 进程与会话保持存活，因此之后 `/compress`、`/clear`、`/resume` 仍然可用。也就是说，一次 stop 不再必然意味着会话结束。
+对于支持优雅取消的 Agent（ACP 系 Agent），`/stop` 只中断当前这一轮，Agent 进程与会话保持存活，因此之后 `/compress`、`/clear`、`/resume` 仍然可用。也就是说，一次 stop 不再必然意味着会话结束。在本 fork 中，Claude Code 不使用优雅取消：`/stop` 会关闭 Claude 进程，下一条消息会启动新的进程。
 
 `stop_hook_event` 决定 `/stop` 触发哪个事件：
 
