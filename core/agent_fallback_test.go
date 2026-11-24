@@ -1648,8 +1648,8 @@ func TestAgentFallback_StopRetargetsReplacedState(t *testing.T) {
 	env := newFallbackEnv(t, nil, []scriptedTurn{okTurn("unused")})
 	session := env.e.sessions.GetOrCreateActive(fallbackTestKey)
 	gen, _ := session.TryLock()
-	a := &interactiveState{agentSession: newScriptedSession("a"), busySession: session, platform: env.p, replyCtx: "ctx", fallbackIntercept: interceptRetriable}
-	b := &interactiveState{agentSession: newScriptedSession("b"), busySession: session, platform: env.p, replyCtx: "ctx", fallbackIntercept: interceptRetriable}
+	a := &interactiveState{agentSession: newScriptedSession("a"), busySession: session, platform: env.p, replyCtx: "ctx", interactiveFallback: interactiveFallback{fallbackIntercept: interceptRetriable}}
+	b := &interactiveState{agentSession: newScriptedSession("b"), busySession: session, platform: env.p, replyCtx: "ctx", interactiveFallback: interactiveFallback{fallbackIntercept: interceptRetriable}}
 	env.e.interactiveMu.Lock()
 	env.e.interactiveStates[fallbackTestKey] = a
 	env.e.interactiveMu.Unlock()
