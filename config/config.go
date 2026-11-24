@@ -1650,19 +1650,11 @@ func SaveAgentModel(projectName, model string) error {
 func AddProviderToConfig(projectName string, provider ProviderConfig) error {
 	configMu.Lock()
 	defer configMu.Unlock()
-	if ConfigPath == "" {
-		return fmt.Errorf("config path not set")
-	}
-	data, err := os.ReadFile(ConfigPath)
+	data, cfg, err := loadDocumentConfigLocked()
 	if err != nil {
-		return fmt.Errorf("read config: %w", err)
-	}
-	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
-		return fmt.Errorf("parse config: %w", err)
+		return err
 	}
 
-	found := false
 	for i := range cfg.Projects {
 		if cfg.Projects[i].Name == projectName {
 			for _, existing := range cfg.Projects[i].Agent.Providers {
@@ -1671,14 +1663,16 @@ func AddProviderToConfig(projectName string, provider ProviderConfig) error {
 				}
 			}
 			cfg.Projects[i].Agent.Providers = append(cfg.Projects[i].Agent.Providers, provider)
-			found = true
-			break
+			block, err := serializeProviderBlock(provider, "projects.agent.providers")
+			if err != nil {
+				return err
+			}
+			return saveDocumentPatch(data, cfg, func(raw string) (string, error) {
+				return insertProviderBlock(raw, i, block)
+			})
 		}
 	}
-	if !found {
-		return fmt.Errorf("project %q not found in config", projectName)
-	}
-	return saveConfig(cfg)
+	return fmt.Errorf("project %q not found in config", projectName)
 }
 
 // RemoveProviderFromConfig removes a provider from a project's agent config and saves.
@@ -1687,47 +1681,56 @@ func AddProviderToConfig(projectName string, provider ProviderConfig) error {
 func RemoveProviderFromConfig(projectName, providerName string) error {
 	configMu.Lock()
 	defer configMu.Unlock()
-	if ConfigPath == "" {
-		return fmt.Errorf("config path not set")
-	}
-	data, err := os.ReadFile(ConfigPath)
+	data, cfg, err := loadDocumentConfigLocked()
 	if err != nil {
-		return fmt.Errorf("read config: %w", err)
-	}
-	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
-		return fmt.Errorf("parse config: %w", err)
+		return err
 	}
 
-	found := false
 	for i := range cfg.Projects {
 		if cfg.Projects[i].Name != projectName {
 			continue
 		}
 		// Check inline providers
 		providers := cfg.Projects[i].Agent.Providers
+		inlineIndex := -1
 		for j := range providers {
 			if providers[j].Name == providerName {
 				cfg.Projects[i].Agent.Providers = append(providers[:j], providers[j+1:]...)
-				found = true
+				if len(cfg.Projects[i].Agent.Providers) == 0 {
+					cfg.Projects[i].Agent.Providers = nil
+				}
+				inlineIndex = j
 				break
 			}
 		}
 		// Also remove from provider_refs if present
 		refs := cfg.Projects[i].Agent.ProviderRefs
+		refsChanged := false
 		for j := range refs {
 			if refs[j] == providerName {
 				cfg.Projects[i].Agent.ProviderRefs = append(refs[:j], refs[j+1:]...)
-				found = true
+				refsChanged = true
 				break
 			}
 		}
-		break
+		if inlineIndex < 0 && !refsChanged {
+			return fmt.Errorf("provider %q not found in project %q", providerName, projectName)
+		}
+		return saveDocumentPatch(data, cfg, func(raw string) (string, error) {
+			var err error
+			if inlineIndex >= 0 {
+				raw, err = removeProviderBlock(raw, i, inlineIndex)
+				if err != nil {
+					return "", err
+				}
+			}
+			if refsChanged {
+				raw, err = patchDocument(raw, settingEdit("projects.agent", i, -1, "provider_refs", cfg.Projects[i].Agent.ProviderRefs))
+			}
+			return raw, err
+		})
 	}
-	if !found {
-		return fmt.Errorf("provider %q not found in project %q", providerName, projectName)
-	}
-	return saveConfig(cfg)
+	return fmt.Errorf("provider %q not found in project %q", providerName, projectName)
 }
 
 // ResolveProviderRefs merges global [[providers]] into each project that uses
@@ -1814,7 +1817,7 @@ func ListGlobalProviders() ([]ProviderConfig, error) {
 func AddGlobalProvider(provider ProviderConfig) error {
 	configMu.Lock()
 	defer configMu.Unlock()
-	cfg, err := loadLocked()
+	data, cfg, err := loadDocumentConfigLocked()
 	if err != nil {
 		return err
 	}
@@ -1824,22 +1827,31 @@ func AddGlobalProvider(provider ProviderConfig) error {
 		}
 	}
 	cfg.Providers = append(cfg.Providers, provider)
-	return saveConfig(cfg)
+	block, err := serializeProviderBlock(provider, "providers")
+	if err != nil {
+		return err
+	}
+	return saveDocumentPatch(data, cfg, func(raw string) (string, error) {
+		return insertProviderBlock(raw, -1, block)
+	})
 }
 
 // UpdateGlobalProvider replaces an existing global provider by name.
 func UpdateGlobalProvider(name string, provider ProviderConfig) error {
 	configMu.Lock()
 	defer configMu.Unlock()
-	cfg, err := loadLocked()
+	data, cfg, err := loadDocumentConfigLocked()
 	if err != nil {
 		return err
 	}
 	for i := range cfg.Providers {
 		if cfg.Providers[i].Name == name {
+			old := cfg.Providers[i]
 			provider.Name = name // name is immutable in update
 			cfg.Providers[i] = provider
-			return saveConfig(cfg)
+			return saveDocumentPatch(data, cfg, func(raw string) (string, error) {
+				return patchProviderUpdate(raw, -1, i, old, provider)
+			})
 		}
 	}
 	return fmt.Errorf("global provider %q not found", name)
@@ -1850,31 +1862,49 @@ func UpdateGlobalProvider(name string, provider ProviderConfig) error {
 func RemoveGlobalProvider(name string) error {
 	configMu.Lock()
 	defer configMu.Unlock()
-	cfg, err := loadLocked()
+	data, cfg, err := loadDocumentConfigLocked()
 	if err != nil {
 		return err
 	}
-	found := false
+	index := -1
 	for i := range cfg.Providers {
 		if cfg.Providers[i].Name == name {
 			cfg.Providers = append(cfg.Providers[:i], cfg.Providers[i+1:]...)
-			found = true
+			if len(cfg.Providers) == 0 {
+				cfg.Providers = nil
+			}
+			index = i
 			break
 		}
 	}
-	if !found {
+	if index < 0 {
 		return fmt.Errorf("global provider %q not found", name)
 	}
+	var refEdits []documentEdit
 	for i := range cfg.Projects {
 		refs := cfg.Projects[i].Agent.ProviderRefs
 		for j := 0; j < len(refs); j++ {
 			if refs[j] == name {
 				cfg.Projects[i].Agent.ProviderRefs = append(refs[:j], refs[j+1:]...)
+				refEdits = append(refEdits, settingEdit("projects.agent", i, -1, "provider_refs", cfg.Projects[i].Agent.ProviderRefs))
 				break
 			}
 		}
 	}
-	return saveConfig(cfg)
+	return saveDocumentPatch(data, cfg, func(raw string) (string, error) {
+		var err error
+		raw, err = removeProviderBlock(raw, -1, index)
+		if err != nil {
+			return "", err
+		}
+		for _, edit := range refEdits {
+			raw, err = patchDocument(raw, edit)
+			if err != nil {
+				return "", err
+			}
+		}
+		return raw, nil
+	})
 }
 
 func loadLocked() (*Config, error) {
@@ -3962,6 +3992,9 @@ func GetProjectConfigDetails(projectName string) map[string]any {
 func SaveProviderRefs(projectName string, refs []string) error {
 	configMu.Lock()
 	defer configMu.Unlock()
+	if refs == nil {
+		refs = []string{}
+	}
 	if ConfigPath == "" {
 		return fmt.Errorf("config path not set")
 	}
@@ -3976,7 +4009,7 @@ func SaveProviderRefs(projectName string, refs []string) error {
 	for i := range cfg.Projects {
 		if cfg.Projects[i].Name == projectName {
 			cfg.Projects[i].Agent.ProviderRefs = refs
-			return saveConfig(cfg)
+			return saveSettingsDocument(data, cfg, []documentEdit{settingEdit("projects.agent", i, -1, "provider_refs", refs)})
 		}
 	}
 	return fmt.Errorf("project %q not found", projectName)
@@ -4322,36 +4355,42 @@ func EnableWebAdmin(mgmtToken, bridgeToken string) (*WebSetupResult, error) {
 	}
 
 	t := true
-	changed := false
+	var edits []documentEdit
 	if !mgmtEnabled {
 		cfg.Management.Enabled = &t
+		edits = append(edits, settingEdit("management", -1, -1, "enabled", true))
 		if cfg.Management.Port == 0 {
 			cfg.Management.Port = 9820
+			edits = append(edits, settingEdit("management", -1, -1, "port", cfg.Management.Port))
 		}
 		if cfg.Management.Token == "" {
 			cfg.Management.Token = mgmtToken
+			edits = append(edits, settingEdit("management", -1, -1, "token", cfg.Management.Token))
 		}
 		if len(cfg.Management.CORSOrigins) == 0 {
 			cfg.Management.CORSOrigins = []string{"*"}
+			edits = append(edits, settingEdit("management", -1, -1, "cors_origins", cfg.Management.CORSOrigins))
 		}
-		changed = true
 	}
 	if !bridgeEnabled {
 		cfg.Bridge.Enabled = &t
+		edits = append(edits, settingEdit("bridge", -1, -1, "enabled", true))
 		if cfg.Bridge.Port == 0 {
 			cfg.Bridge.Port = 9810
+			edits = append(edits, settingEdit("bridge", -1, -1, "port", cfg.Bridge.Port))
 		}
 		if cfg.Bridge.Token == "" {
 			cfg.Bridge.Token = bridgeToken
+			edits = append(edits, settingEdit("bridge", -1, -1, "token", cfg.Bridge.Token))
 		}
 		if len(cfg.Bridge.CORSOrigins) == 0 {
 			cfg.Bridge.CORSOrigins = []string{"*"}
+			edits = append(edits, settingEdit("bridge", -1, -1, "cors_origins", cfg.Bridge.CORSOrigins))
 		}
-		changed = true
 	}
 
-	if changed {
-		if err := saveConfig(cfg); err != nil {
+	if len(edits) > 0 {
+		if err := saveSettingsDocument(data, cfg, edits); err != nil {
 			return nil, fmt.Errorf("save config: %w", err)
 		}
 	}
