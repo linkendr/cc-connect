@@ -73,7 +73,8 @@ const (
 )
 
 // fallbackIntercept tells processInteractiveEvents which failures to hand
-// back to the caller (without showing them) instead of surfacing them.
+// back to the caller (without showing them) instead of surfacing them
+// (agent_fallback_hooks.go).
 type fallbackIntercept uint8
 
 const (
@@ -98,8 +99,9 @@ func (m fallbackIntercept) catchesError(ev Event) bool {
 	return false
 }
 
-// turnOutcome is what processInteractiveEvents reports to its caller. The
-// zero value means the turn was handled (answered, or its error shown).
+// turnOutcome is what processInteractiveEvents returns to its caller and
+// what a fallback turn reports. The zero value means the turn was handled
+// (answered, its error shown, or cancelled).
 type turnOutcome struct {
 	// Intercepted is true when the turn failed and nothing was shown to the
 	// user; the caller must answer Input some other way.
@@ -110,11 +112,6 @@ type turnOutcome struct {
 	// Input is the message whose turn failed. It may be a queued message
 	// that the event loop picked up after the original one.
 	Input queuedMessage
-	// Cancelled is true when the turn was stopped (/stop, session reset,
-	// shutdown); nothing more must run for it.
-	Cancelled bool
-	// Failed is true when the turn ended with an error already shown.
-	Failed bool
 	// blocked marks a turn that skipped the primary because of an earlier
 	// reset time (ResetAt).
 	blocked bool
@@ -655,7 +652,7 @@ func (e *Engine) runFallbackTurn(guard fallbackGuard, i int, agent Agent, label 
 	}
 	if guard.cancelled(e) {
 		slog.Info("agent fallback: turn cancelled", "session_key", interactiveKey, "index", i, "stage", "before_state")
-		return turnOutcome{Cancelled: true}
+		return turnOutcome{}
 	}
 	// The fallback session has its own busy lock: one turn at a time per
 	// fallback state, so two turns can never share its event channel.
@@ -663,7 +660,7 @@ func (e *Engine) runFallbackTurn(guard fallbackGuard, i int, agent Agent, label 
 	if !locked {
 		slog.Warn("agent fallback: fallback agent busy with another turn", "session_key", interactiveKey, "index", i)
 		e.send(in.platform, in.replyCtx, e.i18n.T(MsgPreviousProcessing))
-		return turnOutcome{Failed: true}
+		return turnOutcome{}
 	}
 	defer fbSession.Unlock(fbGen)
 	claim := chain.registerState(fbKey, interactiveKey)
@@ -675,7 +672,7 @@ func (e *Engine) runFallbackTurn(guard fallbackGuard, i int, agent Agent, label 
 	if guard.cancelled(e) {
 		slog.Info("agent fallback: turn cancelled", "session_key", interactiveKey, "index", i, "stage", "after_state")
 		e.cleanupInteractiveState(fbKey, state)
-		return turnOutcome{Cancelled: true}
+		return turnOutcome{}
 	}
 	if state.agentSession == nil {
 		return turnOutcome{Intercepted: true, ErrText: e.i18n.T(MsgFailedToStartAgentSession), Input: in}
