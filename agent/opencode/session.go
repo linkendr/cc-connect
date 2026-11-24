@@ -207,11 +207,7 @@ func (s *opencodeSession) Send(prompt string, messageID string, images []core.Im
 	}
 	cmd.WaitDelay = pipeWaitDelay // stdin copy only; stdout/stderr are our own pipes
 	cmd.Dir = s.workDir
-	env := os.Environ()
-	if len(s.extraEnv) > 0 {
-		env = core.MergeEnv(env, s.extraEnv)
-	}
-	cmd.Env = env
+	cmd.Env = opencodeRunEnv(s.workDir, s.extraEnv)
 
 	// The session owns both ends of the output pipes (instead of exec's
 	// StdoutPipe / Stderr copy), so Close can always close the read ends
@@ -257,6 +253,26 @@ func (s *opencodeSession) Send(prompt string, messageID string, images []core.Im
 	go s.readLoop(cmd, proc, stderrBuf, stderrDone)
 
 	return nil
+}
+
+// opencodeRunEnv builds the environment for `opencode run`. opencode takes its
+// project directory from $PWD rather than the process cwd, and os/exec only
+// syncs PWD with cmd.Dir when cmd.Env is nil. Without the override, `run`
+// (which gets no --dir) would work in cc-connect's own directory instead of
+// the session's work dir.
+func opencodeRunEnv(workDir string, extraEnv []string) []string {
+	env := os.Environ()
+	if len(extraEnv) > 0 {
+		env = core.MergeEnv(env, extraEnv)
+	}
+	if workDir != "" {
+		pwd := workDir
+		if abs, err := filepath.Abs(pwd); err == nil {
+			pwd = abs
+		}
+		env = core.MergeEnv(env, []string{"PWD=" + pwd})
+	}
+	return env
 }
 
 func (s *opencodeSession) stageImages(prompt string, images []core.ImageAttachment) (string, []string, error) {
@@ -312,8 +328,8 @@ func (s *opencodeSession) buildRunArgs(prompt string, imagePaths []string, chatI
 	if s.model != "" {
 		args = append(args, "--model", s.model)
 	}
-	// The working directory is set as the process cwd in Send (cmd.Dir), like
-	// the other opencode invocations. `opencode run` has no --dir flag in
+	// The working directory reaches opencode as the process cwd and $PWD in
+	// Send (see opencodeRunEnv). `opencode run` has no --dir flag in
 	// opencode v2 and rejects it ("Unrecognized flag: --dir").
 
 	// Enable thinking blocks.

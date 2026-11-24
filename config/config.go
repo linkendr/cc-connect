@@ -107,6 +107,7 @@ type Config struct {
 	InstantReply       InstantReplyConfig      `toml:"instant_reply"`       // immediate confirmation reply
 	RateLimit          RateLimitConfig         `toml:"rate_limit"`          // per-session rate limiting
 	OutgoingRateLimit  OutgoingRateLimitConfig `toml:"outgoing_rate_limit"` // outgoing message throttling
+	Dedup              DedupConfig             `toml:"dedup"`               // engine-level message ID deduplication
 	Relay              RelayConfig             `toml:"relay"`               // bot-to-bot relay behavior
 	Cron               CronConfig              `toml:"cron"`
 	Queue              QueueConfig             `toml:"queue"`
@@ -227,6 +228,7 @@ type StreamPreviewConfig struct {
 	IntervalMs        *int     `toml:"interval_ms"`                  // min ms between updates; default 1500
 	MinDeltaChars     *int     `toml:"min_delta_chars"`              // min new chars before update; default 30
 	MaxChars          *int     `toml:"max_chars"`                    // max preview length; default 2000
+	StopBehavior      *string  `toml:"stop_behavior,omitempty"`      // "discard" (default) or "freeze" on /stop
 }
 
 // InstantReplyConfig controls the immediate confirmation reply sent when a message
@@ -249,6 +251,12 @@ type OutgoingRateLimitConfig struct {
 	MaxPerSecond *float64                               `toml:"max_per_second"` // messages per second; 0 = unlimited (default)
 	Burst        *int                                   `toml:"burst"`          // max burst size; default = ceil(max_per_second)
 	Platforms    map[string]OutgoingRateLimitPlatConfig `toml:"platforms"`      // per-platform overrides keyed by platform type name
+}
+
+// DedupConfig controls the engine-level duplicate delivery window.
+type DedupConfig struct {
+	Enabled    *bool `toml:"enabled"`     // default true
+	WindowSecs *int  `toml:"window_secs"` // default 30
 }
 
 // OutgoingRateLimitPlatConfig is a per-platform override for outgoing rate limiting.
@@ -487,6 +495,13 @@ type AutoCompressConfig struct {
 	AllowHeuristic bool `toml:"allow_heuristic,omitempty"`
 }
 
+// HistoryBootstrapConfig bounds the prior conversation sent after an agent switch.
+type HistoryBootstrapConfig struct {
+	Enabled    *bool `toml:"enabled,omitempty"`
+	MaxEntries *int  `toml:"max_entries,omitempty"`
+	MaxTokens  *int  `toml:"max_tokens,omitempty"`
+}
+
 // ObserveConfig controls forwarding of native terminal Claude Code sessions to a messaging platform.
 type ObserveConfig struct {
 	Enabled bool   `toml:"enabled"`
@@ -512,11 +527,12 @@ type ProjectConfig struct {
 	// init flow to bind existing local directories. Default false keeps init
 	// limited to git URLs; use /workspace bind or /workspace route for explicit
 	// local bindings.
-	WorkspaceInitAllowLocalPaths *bool              `toml:"workspace_init_allow_local_paths,omitempty"`
-	Agent                        AgentConfig        `toml:"agent"`
-	Platforms                    []PlatformConfig   `toml:"platforms"`
-	Heartbeat                    HeartbeatConfig    `toml:"heartbeat"`
-	AutoCompress                 AutoCompressConfig `toml:"auto_compress"`
+	WorkspaceInitAllowLocalPaths *bool                  `toml:"workspace_init_allow_local_paths,omitempty"`
+	Agent                        AgentConfig            `toml:"agent"`
+	Platforms                    []PlatformConfig       `toml:"platforms"`
+	Heartbeat                    HeartbeatConfig        `toml:"heartbeat"`
+	AutoCompress                 AutoCompressConfig     `toml:"auto_compress"`
+	HistoryBootstrap             HistoryBootstrapConfig `toml:"history_bootstrap"`
 	// ResetOnIdleMins automatically rotates to a new cc-connect session after
 	// the current session has been inactive for the specified number of minutes.
 	// 0 or nil disables the behavior.
@@ -3870,7 +3886,11 @@ func SaveProjectSettings(projectName string, update ProjectSettingsUpdate) error
 				proj.Platforms[j].Options["allow_from"] = strings.TrimSpace(af)
 			}
 		}
-		return saveConfig(cfg)
+		edits, err := projectSettingsEdits(data, cfg, i, update)
+		if err != nil {
+			return err
+		}
+		return saveSettingsDocument(data, cfg, edits)
 	}
 	return fmt.Errorf("project %q not found", projectName)
 }
@@ -4259,7 +4279,7 @@ func SaveGlobalSettings(u GlobalSettingsUpdate) error {
 	if u.QueueMaxDepth != nil {
 		cfg.Queue.MaxDepth = u.QueueMaxDepth
 	}
-	return saveConfig(cfg)
+	return saveSettingsDocument(data, cfg, globalSettingsEdits(u))
 }
 
 // WebSetupResult holds the config values after enabling web admin.
