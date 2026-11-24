@@ -622,6 +622,13 @@ func main() {
 			if cfg.StreamPreview.DisabledPlatforms != nil {
 				spcfg.DisabledPlatforms = cfg.StreamPreview.DisabledPlatforms
 			}
+			if cfg.StreamPreview.StopBehavior != nil {
+				if !core.StopBehaviorIsValid(*cfg.StreamPreview.StopBehavior) {
+					slog.Error("invalid [stream_preview] stop_behavior: expected discard or freeze", "value", *cfg.StreamPreview.StopBehavior)
+					os.Exit(1)
+				}
+				spcfg.StopBehavior = *cfg.StreamPreview.StopBehavior
+			}
 			engine.SetStreamPreviewCfg(spcfg)
 		}
 
@@ -650,6 +657,7 @@ func main() {
 				})
 			}
 		}
+		applyDedupConfig(cfg, engine)
 		// Wire outgoing rate limiting
 		{
 			var maxPS float64
@@ -730,6 +738,7 @@ func main() {
 			}
 			engine.SetAutoCompressConfigWithSource(true, maxTokens, minGap, proj.AutoCompress.AllowHeuristic)
 		}
+		applyHistoryBootstrapConfig(&proj, engine)
 		resetIdle, defaulted := resolveResetOnIdle(proj.ResetOnIdleMins)
 		engine.SetResetOnIdle(resetIdle)
 		if defaulted {
@@ -1801,6 +1810,20 @@ func setupLogger(level string, w io.Writer) {
 	})))
 }
 
+func applyDedupConfig(cfg *config.Config, engine *core.Engine) {
+	enabled := cfg.Dedup.Enabled == nil || *cfg.Dedup.Enabled
+	windowSecs := 30
+	if cfg.Dedup.WindowSecs != nil && *cfg.Dedup.WindowSecs > 0 {
+		windowSecs = *cfg.Dedup.WindowSecs
+	}
+	engine.SetDedupConfig(enabled, time.Duration(windowSecs)*time.Second)
+}
+
+func applyHistoryBootstrapConfig(proj *config.ProjectConfig, engine *core.Engine) {
+	enabled := proj.HistoryBootstrap.Enabled == nil || *proj.HistoryBootstrap.Enabled
+	engine.SetHistoryBootstrap(enabled, derefInt(proj.HistoryBootstrap.MaxEntries), derefInt(proj.HistoryBootstrap.MaxTokens))
+}
+
 // reloadConfig re-reads config.toml and applies hot-reloadable settings
 // (display, providers, commands) to the given engine.
 func reloadConfig(configPath, projName string, engine *core.Engine) (*core.ConfigReloadResult, error) {
@@ -1866,6 +1889,7 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 	} else {
 		engine.SetAutoCompressConfig(false, 0, 0)
 	}
+	applyHistoryBootstrapConfig(proj, engine)
 	resetIdle, defaulted := resolveResetOnIdle(proj.ResetOnIdleMins)
 	engine.SetResetOnIdle(resetIdle)
 	if defaulted {
@@ -1910,6 +1934,7 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 	// Reload attachment send-back switch
 	engine.SetAttachmentSendEnabled(cfg.AttachmentSend != "off")
 
+	applyDedupConfig(cfg, engine)
 	// Reload filter_external_sessions
 	engine.SetFilterExternalSessions(proj.FilterExternalSessions != nil && *proj.FilterExternalSessions)
 
