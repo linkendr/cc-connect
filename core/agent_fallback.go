@@ -99,9 +99,8 @@ func (m fallbackIntercept) catchesError(ev Event) bool {
 	return false
 }
 
-// turnOutcome is what processInteractiveEvents hands back to its caller
-// (interactiveState.fallbackOutcome, takeFallbackOutcome) and what a
-// fallback turn reports. The zero value means the turn was handled
+// turnOutcome is what processInteractiveEvents returns to its caller and
+// what a fallback turn reports. The zero value means the turn was handled
 // (answered, its error shown, or cancelled).
 type turnOutcome struct {
 	// Intercepted is true when the turn failed and nothing was shown to the
@@ -727,8 +726,7 @@ func (e *Engine) runFallbackTurn(guard fallbackGuard, i int, agent Agent, label 
 		}
 		sendDone <- err
 	}()
-	e.processInteractiveEvents(state, fbSession, fbSessions, fbKey, in.messageID, time.Now(), stopTyping, sendDone, in.replyCtx, fbGen)
-	out := state.takeFallbackOutcome()
+	out := e.processInteractiveEvents(state, fbSession, fbSessions, fbKey, in.messageID, time.Now(), stopTyping, sendDone, in.replyCtx, fbGen)
 
 	state.mu.Lock()
 	state.fallbackIntercept = interceptNone

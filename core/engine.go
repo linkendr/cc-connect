@@ -4295,12 +4295,12 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 		sendDone <- err
 	}()
 
-	e.processInteractiveEvents(state, session, sessions, interactiveKey, msg.MessageID, turnStart, stopTyping, sendDone, msg.ReplyCtx, lockGen)
+	outcome := e.processInteractiveEvents(state, session, sessions, interactiveKey, msg.MessageID, turnStart, stopTyping, sendDone, msg.ReplyCtx, lockGen)
 	if elapsed := time.Since(sendStart); elapsed >= slowAgentSend {
 		slog.Warn("slow agent send", "elapsed", elapsed, "session", msg.SessionKey, "content_len", len(msg.Content))
 	}
 	stopTyping = nil // ownership transferred; prevent defer from double-stopping
-	fb.afterPrimaryTurn()
+	fb.afterPrimaryTurn(outcome)
 
 	// Start unsolicited reader and arm the idle close timer BEFORE draining
 	// queued messages. drainPendingMessages releases the session lock, and
@@ -5566,7 +5566,7 @@ var agentErrorHandlers = []agentErrorHandler{
 	{"Session not found", MsgSessionNotFound},
 }
 
-func (e *Engine) processInteractiveEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, msgID string, turnStart time.Time, stopTypingFn func(), sendDone <-chan error, replyCtx any, lockGen uint64) {
+func (e *Engine) processInteractiveEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, msgID string, turnStart time.Time, stopTypingFn func(), sendDone <-chan error, replyCtx any, lockGen uint64) (outcome turnOutcome) {
 	if msgID != "" {
 		state.mu.Lock()
 		state.currentMessageID = msgID
@@ -5667,7 +5667,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 	events := state.agentSession.Events()
 	stopCh := state.stopSignal()
-	fbt := e.beginFallbackEvents(state, session, sessions, sessionKey, cp, sp, &pendingSend)
+	fbt := e.beginFallbackEvents(state, session, sessions, sessionKey, &cp, &sp, &pendingSend, &outcome)
 	for {
 		var event Event
 		var ok bool
@@ -7110,6 +7110,7 @@ channelClosed:
 			}
 		}
 	}
+	return
 }
 
 func mergeRichToolResult(steps []ToolStep, event Event, result string, maxLen int) []ToolStep {
@@ -7178,10 +7179,11 @@ func (e *Engine) notifyDroppedQueuedMessages(state *interactiveState, reason err
 // Returns true if the session was unlocked by this call.
 func (e *Engine) drainPendingMessages(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, lockGen uint64) bool {
 	for {
-		if e.fallbackDrainLostTurn(state, session, lockGen) {
+		state.mu.Lock()
+		if e.fallbackDrainLostTurnLocked(state, session, lockGen) {
+			state.mu.Unlock()
 			return false
 		}
-		state.mu.Lock()
 		if len(state.pendingMessages) == 0 && state.restartAfterTurn {
 			// A /model switch was deferred while the turn ran. Its reply has
 			// been delivered, so restart the agent session now, while the
@@ -7265,8 +7267,7 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		}
 
 		slog.Info("processing queued message", "session", sessionKey)
-		e.processInteractiveEvents(state, session, sessions, sessionKey, queued.messageID, time.Now(), stopTyping, sendDone, queued.replyCtx, lockGen)
-		fd.afterTurn()
+		fd.afterTurn(e.processInteractiveEvents(state, session, sessions, sessionKey, queued.messageID, time.Now(), stopTyping, sendDone, queued.replyCtx, lockGen))
 	}
 }
 
