@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -64,7 +65,7 @@ func saveDocumentPatch(original []byte, expected *Config, patch func(string) (st
 	if patchErr == nil {
 		var actual Config
 		if err := toml.Unmarshal([]byte(patched), &actual); err != nil {
-			patchErr = fmt.Errorf("parse patched document: %w", err)
+			patchErr = safePatchedDocumentError(err)
 		} else if !reflect.DeepEqual(&actual, expected) {
 			patchErr = fmt.Errorf("patched settings differ from requested configuration")
 		}
@@ -90,6 +91,16 @@ func saveDocumentPatch(original []byte, expected *Config, patch func(string) (st
 		return nil
 	}
 	return writeConfigAtomically(original, []byte(patched))
+}
+
+// BurntSushi's parse error may include a source key or value. Keep its line
+// number for the operator without copying any TOML content into the log.
+func safePatchedDocumentError(err error) error {
+	var parseErr toml.ParseError
+	if errors.As(err, &parseErr) && parseErr.Position.Line > 0 {
+		return fmt.Errorf("parse patched document: line %d: invalid TOML", parseErr.Position.Line)
+	}
+	return fmt.Errorf("parse patched document: invalid TOML")
 }
 
 func validateLegacySettingsSave(expected *Config) error {
@@ -336,7 +347,7 @@ func scanConfigDocument(raw string) ([]documentEntry, []documentTable, error) {
 		if strings.HasPrefix(line, "[") {
 			name, array, err := parseDocumentHeader(line)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, fmt.Errorf("line %d: %w", 1+strings.Count(raw[:at], "\n"), err)
 			}
 			tables[len(tables)-1].end = at
 			if name == "projects" && array {
@@ -379,7 +390,7 @@ func scanConfigDocument(raw string) ([]documentEntry, []documentTable, error) {
 		}
 		key, eq, err := parseDocumentAssignment(raw[at:lineEnd])
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, fmt.Errorf("line %d: %w", 1+strings.Count(raw[:at], "\n"), err)
 		}
 		valueAt := at + eq + 1
 		for valueAt < len(raw) && (raw[valueAt] == ' ' || raw[valueAt] == '\t') {
@@ -387,7 +398,7 @@ func scanConfigDocument(raw string) ([]documentEntry, []documentTable, error) {
 		}
 		valueEnd, assignmentEnd, err := scanDocumentValue(raw, valueAt)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, fmt.Errorf("line %d: %w", 1+strings.Count(raw[:at], "\n"), err)
 		}
 		entries = append(entries, documentEntry{table: table, project: project, platform: platform, provider: provider, key: key, lineStart: at, valueAt: valueAt, valueEnd: valueEnd, lineEnd: assignmentEnd})
 		at = assignmentEnd
@@ -403,11 +414,11 @@ func parseDocumentHeader(line string) (string, bool, error) {
 	}
 	end := strings.Index(line[open:], strings.Repeat("]", close))
 	if end < 0 {
-		return "", false, fmt.Errorf("unsupported TOML header: %q", line)
+		return "", false, fmt.Errorf("unsupported TOML header")
 	}
 	end += open
 	if tail := strings.TrimSpace(line[end+close:]); tail != "" && !strings.HasPrefix(tail, "#") {
-		return "", false, fmt.Errorf("unsupported TOML header suffix: %q", line)
+		return "", false, fmt.Errorf("unsupported TOML header suffix")
 	}
 	parts, err := parseDocumentName(line[open:end])
 	if err != nil {
@@ -439,12 +450,12 @@ func parseDocumentAssignment(line string) (string, int, error) {
 		if c == '=' {
 			parts, err := parseDocumentName(line[:i])
 			if err != nil {
-				return "", 0, fmt.Errorf("unsupported TOML assignment key: %q", line[:i])
+				return "", 0, fmt.Errorf("unsupported TOML assignment key")
 			}
 			return strings.Join(parts, "."), i, nil
 		}
 	}
-	return "", 0, fmt.Errorf("unsupported TOML line: %q", line)
+	return "", 0, fmt.Errorf("unsupported TOML line")
 }
 
 func parseDocumentName(raw string) ([]string, error) {
@@ -465,7 +476,7 @@ func parseDocumentName(raw string) ([]string, error) {
 				escaped = false
 			}
 			if i >= len(s) {
-				return nil, fmt.Errorf("unterminated TOML name %q", raw)
+				return nil, fmt.Errorf("unterminated TOML name")
 			}
 			if quote == '"' {
 				v, err := strconv.Unquote(s[:i+1])
@@ -486,20 +497,20 @@ func parseDocumentName(raw string) ([]string, error) {
 			for _, c := range part {
 				valid := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-'
 				if !valid {
-					return nil, fmt.Errorf("unsupported TOML name %q", raw)
+					return nil, fmt.Errorf("unsupported TOML name")
 				}
 			}
 			s = strings.TrimSpace(s[i:])
 		}
 		if part == "" {
-			return nil, fmt.Errorf("empty TOML name in %q", raw)
+			return nil, fmt.Errorf("empty TOML name")
 		}
 		parts = append(parts, part)
 		if s == "" {
 			break
 		}
 		if s[0] != '.' {
-			return nil, fmt.Errorf("unsupported TOML name %q", raw)
+			return nil, fmt.Errorf("unsupported TOML name")
 		}
 		s = strings.TrimSpace(s[1:])
 	}

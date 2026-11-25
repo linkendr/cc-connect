@@ -39,6 +39,10 @@ func startFakeTurn(t *testing.T, script string) (*opencodeSession, int) {
 	}
 }
 
+// answerText makes a fake CLI stream one line of answer text: a clean exit
+// without answer text is an error since upstream 15652618.
+const answerText = `echo '{"type":"text","part":{"text":"answer"}}'`
+
 func alive(pid int) bool {
 	return syscall.Kill(pid, 0) == nil
 }
@@ -167,10 +171,10 @@ func TestOpencodeHeldStderrReaderJoinedAtDeadline(t *testing.T) {
 	}
 }
 
-// Item 2: the CLI exits 0 and a descendant keeps stderr open silently:
-// main's empty result, not an error.
+// Item 2: the CLI answers, exits 0 and a descendant keeps stderr open
+// silently: the turn's result after the bounded stderr wait, not an error.
 func TestOpencodeCleanExitWithHeldStderrIsResult(t *testing.T) {
-	script := `sleep 30 </dev/null >/dev/null &` + "\nexit 0"
+	script := answerText + "\n" + `sleep 30 </dev/null >/dev/null &` + "\nexit 0"
 	s, err := newOpencodeSession(context.Background(), writeFakeOpencode(t, script), nil, t.TempDir(), "", "default", "", "", nil)
 	if err != nil {
 		t.Fatalf("newOpencodeSession: %v", err)
@@ -179,13 +183,11 @@ func TestOpencodeCleanExitWithHeldStderrIsResult(t *testing.T) {
 	if err := s.Send("hi", "m1", nil, nil); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
-	select {
-	case evt := <-s.Events():
-		if evt.Type != core.EventResult {
-			t.Fatalf("event = %v (%v), want EventResult", evt.Type, evt.Error)
-		}
-	case <-time.After(pipeWaitDelay + 5*time.Second):
-		t.Fatal("no event")
+	if evt := firstEvent(t, s); evt.Type != core.EventText {
+		t.Fatalf("event = %v (%v), want EventText", evt.Type, evt.Error)
+	}
+	if evt := firstEvent(t, s); evt.Type != core.EventResult {
+		t.Fatalf("event = %v (%v), want EventResult", evt.Type, evt.Error)
 	}
 }
 
@@ -249,11 +251,11 @@ func TestOpencodeExternalSIGKILLIsError(t *testing.T) {
 	}
 }
 
-// Round 11 (2): our own turn-end kill of a CLI that closed its output but
-// kept running: unchanged, an empty result (no silent-crash error).
+// Round 11 (2): our own turn-end kill of a CLI that answered, closed its
+// output and kept running is a clean exit: the turn's result, not an error.
 func TestOpencodeOwnTurnEndKillIsResult(t *testing.T) {
 	needsLeaderState(t)
-	s, err := newOpencodeSession(context.Background(), writeFakeOpencode(t, "exec sleep 30 >&- 2>&-"), nil, t.TempDir(), "", "default", "", "", nil)
+	s, err := newOpencodeSession(context.Background(), writeFakeOpencode(t, answerText+"\nexec sleep 30 >&- 2>&-"), nil, t.TempDir(), "", "default", "", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,7 +263,13 @@ func TestOpencodeOwnTurnEndKillIsResult(t *testing.T) {
 	if err := s.Send("hi", "m1", nil, nil); err != nil {
 		t.Fatal(err)
 	}
+	if evt := firstEvent(t, s); evt.Type != core.EventText {
+		t.Fatalf("event = %v (%v), want EventText", evt.Type, evt.Error)
+	}
 	if evt := firstEvent(t, s); evt.Type != core.EventResult {
 		t.Fatalf("event = %v (%v), want EventResult", evt.Type, evt.Error)
+	}
+	if !s.Alive() {
+		t.Fatal("our own turn-end kill closed the reusable session")
 	}
 }

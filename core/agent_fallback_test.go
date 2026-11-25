@@ -370,6 +370,43 @@ func (env *fallbackEnv) waitIdle() {
 	env.t.Fatalf("turn did not finish; sent = %#v", env.p.getSent())
 }
 
+// expectQueuedBehindTurn checks that the message just received was queued
+// behind the running turn (not run beside it, not rejected).
+func (env *fallbackEnv) expectQueuedBehindTurn() {
+	env.t.Helper()
+	if got := env.sentContaining("will process after the current task finishes"); got != 1 {
+		env.t.Errorf("second message not queued behind the turn; sent = %#v", env.p.getSent())
+	}
+	if got := env.sentContaining("Previous request still processing"); got != 0 {
+		env.t.Errorf("second message rejected; sent = %#v", env.p.getSent())
+	}
+}
+
+// expectQueuedAnsweredAfter waits until the restarted primary answered the
+// queued second message, after the turn's answer first, and the turn ended.
+func (env *fallbackEnv) expectQueuedAnsweredAfter(first string) {
+	env.t.Helper()
+	env.waitSent("primary answer")
+	env.waitIdle()
+	sent := env.p.getSent()
+	firstAt, secondAt := -1, -1
+	for i, s := range sent {
+		if firstAt < 0 && strings.Contains(s, first) {
+			firstAt = i
+		}
+		if strings.Contains(s, "primary answer") {
+			secondAt = i
+		}
+	}
+	if firstAt < 0 || secondAt < firstAt {
+		env.t.Errorf("want %q before the queued message's answer; sent = %#v", first, sent)
+	}
+	prompts := env.primary.session.prompts()
+	if len(prompts) != 2 || !strings.HasSuffix(prompts[1], "second") {
+		env.t.Errorf("primary prompts = %#v, want first, then second once", prompts)
+	}
+}
+
 // waitSent polls until some sent message contains want.
 func (env *fallbackEnv) waitSent(want string) {
 	env.t.Helper()
@@ -1483,7 +1520,7 @@ func TestAgentFallback_StaleDrainLeavesNewerQueue(t *testing.T) {
 // lock and start a second turn.
 func TestAgentFallback_StaleLockKeepsLiveFallbackTurn(t *testing.T) {
 	env := newFallbackEnv(t,
-		[]scriptedTurn{errorTurn(`API Error: {"error":{"type":"rate_limit_error"}}`, ErrorKindRateLimit)},
+		[]scriptedTurn{errorTurn(`API Error: {"error":{"type":"rate_limit_error"}}`, ErrorKindRateLimit), okTurn("primary answer")},
 		[]scriptedTurn{okTurn("fallback answer")},
 	)
 	env.e.SetStaleLockBreakAfter(time.Nanosecond) // every held lock looks stale
@@ -1493,18 +1530,12 @@ func TestAgentFallback_StaleLockKeepsLiveFallbackTurn(t *testing.T) {
 	env.receive("first")
 	waitClosed(t, entered, "fallback turn")
 	env.receive("second")
-	if got := env.sentContaining("Previous request still processing"); got != 1 {
-		t.Errorf("second message not rejected as still processing; sent = %#v", env.p.getSent())
-	}
+	env.expectQueuedBehindTurn()
 	if got := env.sentContaining("会话卡锁已自动恢复"); got != 0 {
 		t.Errorf("stale-lock recovery broke a live fallback turn's lock")
 	}
 	close(release)
-	env.waitSent("fallback answer")
-	env.waitIdle()
-	if got := env.primary.StartCount(); got != 1 {
-		t.Errorf("primary started %d times, want 1", got)
-	}
+	env.expectQueuedAnsweredAfter("fallback answer")
 	if got := len(env.fbs[0].session.prompts()); got != 1 {
 		t.Errorf("fallback got %d prompts, want 1", got)
 	}
@@ -1702,11 +1733,13 @@ func TestAgentFallback_StopRetargetsReplacedState(t *testing.T) {
 
 // R4-2: the primary failed and the fallback notice is still being sent when
 // a second message arrives with an expired stale-lock threshold: the
-// conversation is in hand-off, so the lock is not broken and the original
-// turn still gets its fallback answer.
+// conversation is in hand-off, so the lock is not broken: the second message
+// queues behind the turn (upstream eeda3b02 queues while a dead agent holds
+// the lock), the original turn gets its fallback answer, then the restarted
+// primary answers the second message.
 func TestAgentFallback_StaleLockKeepsTurnDuringHandoff(t *testing.T) {
 	env := newFallbackEnv(t,
-		[]scriptedTurn{errorTurn(`API Error: {"error":{"type":"rate_limit_error"}}`, ErrorKindRateLimit)},
+		[]scriptedTurn{errorTurn(`API Error: {"error":{"type":"rate_limit_error"}}`, ErrorKindRateLimit), okTurn("primary answer")},
 		[]scriptedTurn{okTurn("fallback answer")},
 	)
 	env.e.SetStaleLockBreakAfter(time.Nanosecond)
@@ -1724,15 +1757,12 @@ func TestAgentFallback_StaleLockKeepsTurnDuringHandoff(t *testing.T) {
 	env.receive("first")
 	waitClosed(t, inNotice, "fallback notice")
 	env.receive("second")
-	if got := env.sentContaining("Previous request still processing"); got != 1 {
-		t.Errorf("second message not rejected during hand-off; sent = %#v", env.p.getSent())
-	}
+	env.expectQueuedBehindTurn()
 	if env.sentContaining("会话卡锁已自动恢复") != 0 {
 		t.Error("stale-lock recovery broke the lock during the hand-off")
 	}
 	close(releaseNotice)
-	env.waitSent("fallback answer")
-	env.waitIdle()
+	env.expectQueuedAnsweredAfter("fallback answer")
 	if env.e.agentFallback.inHandoff(fallbackTestKey) {
 		t.Error("hand-off not ended after the chain finished")
 	}
@@ -1946,18 +1976,21 @@ func TestAgentFallback_StopWithoutPrimaryStopsFallback(t *testing.T) {
 
 // R5-3: the hand-off is recorded before any blocking work of the
 // interception (here: the primary's Send still returning). A second message
-// with an expired stale-lock threshold is rejected, and the original turn
-// gets its fallback answer.
+// with an expired stale-lock threshold queues behind the turn, the original
+// turn gets its fallback answer, then the restarted primary answers it.
 func TestAgentFallback_HandoffRecordedBeforeBlockingWork(t *testing.T) {
 	env := newFallbackEnv(t,
-		[]scriptedTurn{errorTurn(`API Error: {"error":{"type":"rate_limit_error"}}`, ErrorKindRateLimit)},
+		[]scriptedTurn{errorTurn(`API Error: {"error":{"type":"rate_limit_error"}}`, ErrorKindRateLimit), okTurn("primary answer")},
 		[]scriptedTurn{okTurn("fallback answer")},
 	)
 	env.e.SetStaleLockBreakAfter(time.Nanosecond)
 	primary := env.primary.session
 	primary.dieAfter = map[int]bool{0: true}
 	inSend, releaseSend := make(chan struct{}), make(chan struct{})
-	primary.afterTurn = func(int) {
+	primary.afterTurn = func(n int) {
+		if n != 0 {
+			return
+		}
 		close(inSend)
 		<-releaseSend // Send has emitted the error but not returned yet
 	}
@@ -1971,15 +2004,12 @@ func TestAgentFallback_HandoffRecordedBeforeBlockingWork(t *testing.T) {
 		time.Sleep(2 * time.Millisecond)
 	}
 	env.receive("second")
-	if got := env.sentContaining("Previous request still processing"); got != 1 {
-		t.Errorf("second message not rejected; sent = %#v", env.p.getSent())
-	}
+	env.expectQueuedBehindTurn()
 	if env.sentContaining("会话卡锁已自动恢复") != 0 {
 		t.Error("stale-lock recovery broke the lock before the hand-off was recorded")
 	}
 	close(releaseSend)
-	env.waitSent("fallback answer")
-	env.waitIdle()
+	env.expectQueuedAnsweredAfter("fallback answer")
 }
 
 // R5-5: engine Stop answers a fallback's pending permission (deny) so the

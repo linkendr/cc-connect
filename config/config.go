@@ -479,14 +479,15 @@ type HeartbeatConfig struct {
 // for agents that have no such mechanism, or for users who want compaction at a
 // visible, predictable turn boundary.
 type AutoCompressConfig struct {
-	Enabled    *bool `toml:"enabled,omitempty"`      // default false
-	MaxTokens  *int  `toml:"max_tokens,omitempty"`   // estimated token threshold to trigger /compress
-	MinGapMins *int  `toml:"min_gap_mins,omitempty"` // minimum minutes between auto-compress runs (default 30)
+	Enabled        *bool `toml:"enabled,omitempty"`         // default false
+	MaxTokens      *int  `toml:"max_tokens,omitempty"`      // estimated token threshold to trigger /compress
+	MinGapMins     *int  `toml:"min_gap_mins,omitempty"`    // minimum minutes between auto-compress runs (default 30)
+	OverheadTokens *int  `toml:"overhead_tokens,omitempty"` // fixed prompt/tool allowance for heuristic estimates (default 0)
 	// AllowHeuristic restores deciding from the text-length heuristic when an
 	// agent that CAN report exact usage has not reported it yet. Default false:
 	// such turns make no decision and wait for the next turn, which carries the
-	// exact number. The heuristic ignores tool results and the fixed
-	// system-prompt+tools overhead, so it was measured 2.5x off (574,797
+	// exact number. The heuristic ignores tool results and can only approximate
+	// system-prompt+tools overhead via OverheadTokens, so it was measured 2.5x off (574,797
 	// estimated vs 229,783 real).
 	//
 	// This does not apply to agents with no usage reporting at all: for them the
@@ -2061,16 +2062,9 @@ func ListProjects() ([]string, error) {
 func AddCommand(cmd CommandConfig) error {
 	configMu.Lock()
 	defer configMu.Unlock()
-	if ConfigPath == "" {
-		return fmt.Errorf("config path not set")
-	}
-	data, err := os.ReadFile(ConfigPath)
+	data, cfg, err := loadDocumentConfigLocked()
 	if err != nil {
-		return fmt.Errorf("read config: %w", err)
-	}
-	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
-		return fmt.Errorf("parse config: %w", err)
+		return err
 	}
 	for _, c := range cfg.Commands {
 		if c.Name == cmd.Name {
@@ -2078,94 +2072,99 @@ func AddCommand(cmd CommandConfig) error {
 		}
 	}
 	cfg.Commands = append(cfg.Commands, cmd)
-	return saveConfig(cfg)
+	block, err := serializeCommandBlock(cmd)
+	if err != nil {
+		return err
+	}
+	return saveDocumentPatch(data, cfg, func(raw string) (string, error) { return appendCommandAliasBlock(raw, block), nil })
 }
 
 // RemoveCommand removes a global custom command and persists to config.
 func RemoveCommand(name string) error {
 	configMu.Lock()
 	defer configMu.Unlock()
-	if ConfigPath == "" {
-		return fmt.Errorf("config path not set")
-	}
-	data, err := os.ReadFile(ConfigPath)
+	data, cfg, err := loadDocumentConfigLocked()
 	if err != nil {
-		return fmt.Errorf("read config: %w", err)
+		return err
 	}
-	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
-		return fmt.Errorf("parse config: %w", err)
-	}
-	found := false
+	var indexes []int
 	var remaining []CommandConfig
-	for _, c := range cfg.Commands {
+	for i, c := range cfg.Commands {
 		if c.Name == name {
-			found = true
+			indexes = append(indexes, i)
 		} else {
 			remaining = append(remaining, c)
 		}
 	}
-	if !found {
+	if len(indexes) == 0 {
 		return fmt.Errorf("command %q not found", name)
 	}
 	cfg.Commands = remaining
-	return saveConfig(cfg)
+	return saveDocumentPatch(data, cfg, func(raw string) (string, error) {
+		for i := len(indexes) - 1; i >= 0; i-- {
+			var err error
+			raw, err = removeCommandAliasBlock(raw, "commands", indexes[i])
+			if err != nil {
+				return "", err
+			}
+		}
+		return raw, nil
+	})
 }
 
 // AddAlias adds a global alias and persists to config.
 func AddAlias(alias AliasConfig) error {
 	configMu.Lock()
 	defer configMu.Unlock()
-	if ConfigPath == "" {
-		return fmt.Errorf("config path not set")
-	}
-	data, err := os.ReadFile(ConfigPath)
+	data, cfg, err := loadDocumentConfigLocked()
 	if err != nil {
-		return fmt.Errorf("read config: %w", err)
-	}
-	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
-		return fmt.Errorf("parse config: %w", err)
+		return err
 	}
 	for i, a := range cfg.Aliases {
 		if a.Name == alias.Name {
 			cfg.Aliases[i] = alias
-			return saveConfig(cfg)
+			return saveDocumentPatch(data, cfg, func(raw string) (string, error) { return patchAliasCommand(raw, i, alias.Command) })
 		}
 	}
 	cfg.Aliases = append(cfg.Aliases, alias)
-	return saveConfig(cfg)
+	block, err := serializeAliasBlock(alias)
+	if err != nil {
+		return err
+	}
+	return saveDocumentPatch(data, cfg, func(raw string) (string, error) { return appendCommandAliasBlock(raw, block), nil })
 }
 
 // RemoveAlias removes a global alias and persists to config.
 func RemoveAlias(name string) error {
 	configMu.Lock()
 	defer configMu.Unlock()
-	if ConfigPath == "" {
-		return fmt.Errorf("config path not set")
-	}
-	data, err := os.ReadFile(ConfigPath)
+	data, cfg, err := loadDocumentConfigLocked()
 	if err != nil {
-		return fmt.Errorf("read config: %w", err)
+		return err
 	}
-	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
-		return fmt.Errorf("parse config: %w", err)
-	}
-	found := false
+	var indexes []int
 	var remaining []AliasConfig
-	for _, a := range cfg.Aliases {
+	for i, a := range cfg.Aliases {
 		if a.Name == name {
-			found = true
+			indexes = append(indexes, i)
 		} else {
 			remaining = append(remaining, a)
 		}
 	}
-	if !found {
+	if len(indexes) == 0 {
 		return fmt.Errorf("alias %q not found", name)
 	}
 	cfg.Aliases = remaining
-	return saveConfig(cfg)
+	return saveDocumentPatch(data, cfg, func(raw string) (string, error) {
+		for i := len(indexes) - 1; i >= 0; i-- {
+			var err error
+			raw, err = removeCommandAliasBlock(raw, "aliases", indexes[i])
+			if err != nil {
+				return "", err
+			}
+		}
+		return raw, nil
+	})
 }
 
 // SaveDisplayConfig persists the display settings to the config file.
@@ -4019,29 +4018,22 @@ func SaveProviderRefs(projectName string, refs []string) error {
 func RemoveProject(projectName string) error {
 	configMu.Lock()
 	defer configMu.Unlock()
-	if ConfigPath == "" {
-		return fmt.Errorf("config path not set")
-	}
-	data, err := os.ReadFile(ConfigPath)
+	data, cfg, err := loadDocumentConfigLocked()
 	if err != nil {
-		return fmt.Errorf("read config: %w", err)
+		return err
 	}
-	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
-		return fmt.Errorf("parse config: %w", err)
-	}
-	found := false
 	for i := range cfg.Projects {
 		if cfg.Projects[i].Name == projectName {
 			cfg.Projects = append(cfg.Projects[:i], cfg.Projects[i+1:]...)
-			found = true
-			break
+			if len(cfg.Projects) == 0 {
+				cfg.Projects = nil
+			}
+			return saveDocumentPatch(data, cfg, func(raw string) (string, error) {
+				return removeProjectBlock(raw, i)
+			})
 		}
 	}
-	if !found {
-		return fmt.Errorf("project %q not found", projectName)
-	}
-	return saveConfig(cfg)
+	return fmt.Errorf("project %q not found", projectName)
 }
 
 // AddPlatformToProject appends a platform config to a project.
@@ -4050,24 +4042,23 @@ func RemoveProject(projectName string) error {
 func AddPlatformToProject(projectName string, platform PlatformConfig, workDir, agentType string) error {
 	configMu.Lock()
 	defer configMu.Unlock()
-	if ConfigPath == "" {
-		return fmt.Errorf("config path not set")
-	}
-	data, err := os.ReadFile(ConfigPath)
+	data, cfg, err := loadDocumentConfigLocked()
 	if err != nil {
-		return fmt.Errorf("read config: %w", err)
+		return err
 	}
-	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
-		return fmt.Errorf("parse config: %w", err)
-	}
-	if platform.Options == nil {
-		platform.Options = map[string]any{}
+	if len(platform.Options) == 0 {
+		platform.Options = nil
 	}
 	for i := range cfg.Projects {
 		if cfg.Projects[i].Name == projectName {
 			cfg.Projects[i].Platforms = append(cfg.Projects[i].Platforms, platform)
-			return saveConfig(cfg)
+			block, err := serializePlatformBlock(platform)
+			if err != nil {
+				return err
+			}
+			return saveDocumentPatch(data, cfg, func(raw string) (string, error) {
+				return insertPlatformBlock(raw, i, block)
+			})
 		}
 	}
 	agentCfg := AgentConfig{Type: "codex", Options: map[string]any{}}
@@ -4085,12 +4076,22 @@ func AddPlatformToProject(projectName string, platform PlatformConfig, workDir, 
 		}
 		agentCfg.Options["work_dir"] = wd
 	}
-	cfg.Projects = append(cfg.Projects, ProjectConfig{
+	if len(agentCfg.Options) == 0 {
+		agentCfg.Options = nil
+	}
+	project := ProjectConfig{
 		Name:      projectName,
 		Agent:     agentCfg,
 		Platforms: []PlatformConfig{platform},
+	}
+	cfg.Projects = append(cfg.Projects, project)
+	block, err := serializeProjectBlock(project)
+	if err != nil {
+		return err
+	}
+	return saveDocumentPatch(data, cfg, func(raw string) (string, error) {
+		return insertDocument(raw, len(raw), documentNewline(raw)+projectBlockNewlines(raw, block)), nil
 	})
-	return saveConfig(cfg)
 }
 
 func writeRawConfig(content string) error {

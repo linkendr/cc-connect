@@ -140,9 +140,24 @@ func (s *Session) unlock(update bool, gen uint64) {
 // deliberately above the 120s stop-hook wait cap so a graceful stop can
 // never collide with it. (custom 2026-09-12: busy stale-lock self-heal)
 func (s *Session) BreakStaleLock(maxHeld time.Duration) (time.Time, bool) {
+	return s.breakStaleLockIfGeneration(maxHeld, 0)
+}
+
+// busyLockSnapshot identifies the current holder so a delayed recovery cannot
+// break a different turn that acquired the lock while the timer was waiting.
+func (s *Session) busyLockSnapshot() (uint64, time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.busy || s.busySince.IsZero() {
+	if !s.busy {
+		return 0, time.Time{}
+	}
+	return s.lockGen, s.busySince
+}
+
+func (s *Session) breakStaleLockIfGeneration(maxHeld time.Duration, expected uint64) (time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.busy || s.busySince.IsZero() || (expected != 0 && s.lockGen != expected) {
 		return time.Time{}, false
 	}
 	if time.Since(s.busySince) > maxHeld {
@@ -210,6 +225,18 @@ func (s *Session) GetPrimarySeenAt() time.Time {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.PrimarySeenAt
+}
+
+// SeedHistoryIfEmpty imports a backend transcript without duplicating history
+// already recorded by the bridge or by another concurrent switch.
+func (s *Session) SeedHistoryIfEmpty(entries []HistoryEntry) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.History) != 0 || len(entries) == 0 {
+		return false
+	}
+	s.History = append([]HistoryEntry(nil), entries...)
+	return true
 }
 
 // recordPastAgentSessionID saves the current AgentSessionID to PastAgentSessionIDs
@@ -436,10 +463,13 @@ func (s *Session) MarkHistoryBootstrapped(agentType string) {
 	s.mu.Unlock()
 }
 
-// UserMeta stores human-readable display info for a session key.
+// UserMeta stores the identity and display info for a session key.
 type UserMeta struct {
+	UserID   string `json:"user_id,omitempty"`
 	UserName string `json:"user_name,omitempty"`
+	ChatID   string `json:"chat_id,omitempty"`
 	ChatName string `json:"chat_name,omitempty"`
+	ChatType string `json:"chat_type,omitempty"`
 }
 
 // snapshotVersion tracks the schema version so we can detect data saved by
@@ -651,7 +681,12 @@ func (sm *SessionManager) GetSessionName(agentSessionID string) string {
 // UpdateUserMeta updates the human-readable metadata for a session key.
 // Only non-empty fields are applied (merge behavior).
 func (sm *SessionManager) UpdateUserMeta(sessionKey, userName, chatName string) {
-	if userName == "" && chatName == "" {
+	sm.UpdateUserIdentity(sessionKey, UserMeta{UserName: userName, ChatName: chatName})
+}
+
+// UpdateUserIdentity merges non-empty identity fields from an incoming message.
+func (sm *SessionManager) UpdateUserIdentity(sessionKey string, incoming UserMeta) {
+	if incoming == (UserMeta{}) {
 		return
 	}
 	sm.mu.Lock()
@@ -661,11 +696,20 @@ func (sm *SessionManager) UpdateUserMeta(sessionKey, userName, chatName string) 
 		meta = &UserMeta{}
 		sm.userMeta[sessionKey] = meta
 	}
-	if userName != "" {
-		meta.UserName = userName
+	if incoming.UserID != "" {
+		meta.UserID = incoming.UserID
 	}
-	if chatName != "" {
-		meta.ChatName = chatName
+	if incoming.UserName != "" {
+		meta.UserName = incoming.UserName
+	}
+	if incoming.ChatID != "" {
+		meta.ChatID = incoming.ChatID
+	}
+	if incoming.ChatName != "" {
+		meta.ChatName = incoming.ChatName
+	}
+	if incoming.ChatType != "" {
+		meta.ChatType = incoming.ChatType
 	}
 }
 

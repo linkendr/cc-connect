@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -428,7 +429,7 @@ func main() {
 		engine.SetAgentFallbacks(fallbackSpecs)
 		// Wire display settings including show_context_indicator and reply_footer
 		// Global [display] config can be overridden by project-level settings
-		_, _, _, _, _, showCtx, showFooter, _ := config.EffectiveDisplay(cfg, &proj)
+		mode, thinkingMessages, toolMessages, _, _, showCtx, showFooter, _ := config.EffectiveDisplay(cfg, &proj)
 		engine.SetShowContextIndicator(showCtx)
 		showWorkdir := true
 		if proj.ShowWorkdirIndicator != nil {
@@ -436,6 +437,18 @@ func main() {
 		}
 		engine.SetShowWorkdirIndicator(showWorkdir)
 		engine.SetReplyFooterEnabled(showFooter)
+		var statusFooterPlatforms []string
+		for _, p := range platforms {
+			if _, ok := p.(core.StatusFooterSender); ok {
+				statusFooterPlatforms = append(statusFooterPlatforms, p.Name())
+			}
+		}
+		slog.Info("effective display settings",
+			"project", proj.Name, "mode", mode,
+			"thinking_messages", thinkingMessages, "tool_messages", toolMessages,
+			"reply_footer", showFooter, "show_context_indicator", showCtx,
+			"show_workdir_indicator", showWorkdir,
+			"status_footer_platforms", statusFooterPlatforms)
 		engine.SetAttachmentSendEnabled(cfg.AttachmentSend != "off")
 		engine.SetFilterExternalSessions(proj.FilterExternalSessions != nil && *proj.FilterExternalSessions)
 		engine.SetBaseWorkDir(workDir)
@@ -737,6 +750,7 @@ func main() {
 				maxTokens = 12000
 			}
 			engine.SetAutoCompressConfigWithSource(true, maxTokens, minGap, proj.AutoCompress.AllowHeuristic)
+			engine.SetAutoCompressOverheadTokens(resolveAutoCompressOverheadTokens(proj.AutoCompress.OverheadTokens))
 		}
 		applyHistoryBootstrapConfig(&proj, engine)
 		resetIdle, defaulted := resolveResetOnIdle(proj.ResetOnIdleMins)
@@ -1104,7 +1118,9 @@ func main() {
 			bridgeSrv.RegisterEngine(cfg.Projects[i].Name, e, bp)
 			e.AddPlatform(bp)
 		}
-		bridgeSrv.Start()
+		if err := bridgeSrv.Start(); err != nil {
+			slog.Error("bridge: failed to start server", "addr", fmt.Sprintf(":%d", port), "error", err)
+		}
 	}
 
 	// Start webhook server if enabled
@@ -1886,6 +1902,7 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 			maxTokens = 12000
 		}
 		engine.SetAutoCompressConfigWithSource(true, maxTokens, minGap, proj.AutoCompress.AllowHeuristic)
+		engine.SetAutoCompressOverheadTokens(resolveAutoCompressOverheadTokens(proj.AutoCompress.OverheadTokens))
 	} else {
 		engine.SetAutoCompressConfig(false, 0, 0)
 	}
@@ -2113,8 +2130,48 @@ func wireAgentProviders(agent core.Agent, agentCfg config.AgentConfig) providerW
 	if result.explicitProviderRequested {
 		result.activeProviderApplied = ps.SetActiveProvider(active)
 		result.canStartInitialRefresh = result.activeProviderApplied
+	} else {
+		var applicable []core.ProviderConfig
+		for i, p := range agentCfg.Providers {
+			if len(p.AgentTypes) == 0 || containsString(p.AgentTypes, agentCfg.Type) {
+				applicable = append(applicable, providers[i])
+			}
+		}
+		switch len(applicable) {
+		case 1:
+			result.activeProviderApplied = ps.SetActiveProvider(applicable[0].Name)
+			result.canStartInitialRefresh = result.activeProviderApplied
+			if result.activeProviderApplied {
+				logActiveProviderRoute(applicable[0])
+			}
+		case 0:
+			// No configured provider applies to this agent type.
+		default:
+			names := make([]string, len(applicable))
+			for i, p := range applicable {
+				names[i] = p.Name
+			}
+			slog.Warn("multiple providers available; set options.provider to select one", "providers", names)
+		}
+	}
+	if result.explicitProviderRequested && result.activeProviderApplied {
+		if p := ps.GetActiveProvider(); p != nil {
+			logActiveProviderRoute(*p)
+		}
 	}
 	return result
+}
+
+func logActiveProviderRoute(p core.ProviderConfig) {
+	host := ""
+	if u, err := url.Parse(p.BaseURL); err == nil {
+		host = u.Hostname()
+	}
+	model := p.Model
+	if model == "" {
+		model = p.Env["ANTHROPIC_MODEL"]
+	}
+	slog.Info("agent provider route selected", "provider", p.Name, "base_url_host", host, "model", model)
 }
 
 func startInitialRefreshIfReady(agent core.Agent, result providerWiringResult) {
@@ -2240,4 +2297,11 @@ func derefInt(v *int) int {
 		return 0
 	}
 	return *v
+}
+
+func resolveAutoCompressOverheadTokens(configured *int) int {
+	if configured != nil {
+		return *configured
+	}
+	return core.DefaultAutoCompressOverheadTokens
 }
