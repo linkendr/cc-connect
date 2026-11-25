@@ -7,6 +7,7 @@ package core
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -115,5 +116,71 @@ func TestFallbackCancelledTurnOutcomeEndsHandoff(t *testing.T) {
 	}
 	if env.e.agentFallback.inHandoff(fallbackTestKey) {
 		t.Fatal("cancelled first turn lost its outcome: handoff remains live after both callers finished")
+	}
+}
+
+// envRecordingAgent records the session env the engine injects.
+type envRecordingAgent struct {
+	*scriptedAgent
+	mu  sync.Mutex
+	env []string
+}
+
+func (a *envRecordingAgent) SetSessionEnv(env []string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.env = append([]string(nil), env...)
+}
+
+func (a *envRecordingAgent) sessionKeyEnv() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, kv := range a.env {
+		if v, ok := strings.CutPrefix(kv, "CC_SESSION_KEY="); ok {
+			return v
+		}
+	}
+	return ""
+}
+
+func recordFallbackEnv(env *fallbackEnv) *envRecordingAgent {
+	rec := &envRecordingAgent{scriptedAgent: env.fbs[0]}
+	env.e.agentFallback.factory = func(string, map[string]any) (Agent, error) {
+		return rec, nil
+	}
+	return rec
+}
+
+// The event loop answers a handed-back primary turn itself. The fallback
+// agent still gets the caller's CC_SESSION_KEY (a cron turn's run key),
+// not the interactive key.
+func TestFallbackHandBackKeepsCallerSessionKey(t *testing.T) {
+	env := newFallbackEnv(t, []scriptedTurn{usageLimitTurn(time.Time{})}, []scriptedTurn{okTurn("fallback answer")})
+	rec := recordFallbackEnv(env)
+	s := env.e.sessions.GetOrCreateActive(fallbackTestKey)
+	gen, _ := s.TryLock()
+	msg := &Message{SessionKey: "run-key", Platform: "test", MessageID: "m1", Content: "question", ReplyCtx: "ctx"}
+	env.e.processInteractiveMessageWith(env.p, msg, s, env.e.agent, env.e.sessions, fallbackTestKey, "", "run-key", gen)
+	if env.sentContaining("fallback answer") == 0 {
+		t.Fatalf("handed-back turn not answered by the fallback; sent = %#v", env.p.getSent())
+	}
+	if got := rec.sessionKeyEnv(); got != "run-key" {
+		t.Errorf("fallback CC_SESSION_KEY = %q, want the caller's run-key", got)
+	}
+}
+
+// A queued turn the drain hands back uses the interactive key, as before,
+// even when an earlier turn on the state set another caller key.
+func TestFallbackDrainHandBackUsesInteractiveKey(t *testing.T) {
+	env := newFallbackEnv(t, nil, []scriptedTurn{okTurn("fallback answer")})
+	rec := recordFallbackEnv(env)
+	st, session, gen := env.drainFixture(newScriptedSession("primary-sid", usageLimitTurn(time.Time{})), true)
+	st.turnCCKey = "earlier-run-key"
+	env.e.drainPendingMessages(st, session, env.e.sessions, fallbackTestKey, gen)
+	if env.sentContaining("fallback answer") == 0 {
+		t.Fatalf("handed-back queued turn not answered by the fallback; sent = %#v", env.p.getSent())
+	}
+	if got := rec.sessionKeyEnv(); got != fallbackTestKey {
+		t.Errorf("fallback CC_SESSION_KEY = %q, want %q", got, fallbackTestKey)
 	}
 }

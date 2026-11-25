@@ -29,6 +29,13 @@ type interactiveFallback struct {
 	// turnInput is the message of the in-flight turn, so the caller can
 	// answer it with a fallback agent.
 	turnInput queuedMessage
+	// turnCCKey is the CC_SESSION_KEY of the in-flight turn's caller ("" for
+	// a queued turn the drain started). The event loop's hand-back builds
+	// the turn's fallbackGuard from its own arguments and this key.
+	turnCCKey string
+	// fallbackRun is where the event loop of one fallback turn
+	// (runFallbackTurn) leaves its outcome.
+	fallbackRun fallbackRunOutcome
 	// isFallbackState marks the state of a fallback agent (no
 	// auto-compress, no primary write-back mark).
 	isFallbackState bool
@@ -233,17 +240,24 @@ func (e *Engine) beginPrimaryFallbackTurn(p Platform, msg *Message, agent Agent,
 		agent:        agent,
 		workspaceDir: workspaceDir,
 	}
-	if e.agentFallback == nil || agent != e.agent {
+	if e.agentFallback == nil {
+		return t
+	}
+	chained := agent == e.agent
+	state.mu.Lock()
+	state.turnCCKey = ccSessionKey
+	if chained {
+		// The primary's fallback policy belongs to the state, not to this
+		// turn: messages queued behind a fallback-only turn must still be
+		// eligible (blocked check, interception) when they are drained.
+		state.fallbackIntercept = interceptRetriable
+		state.turnInput = queuedMessageFromMessage(p, msg)
+	}
+	state.mu.Unlock()
+	if !chained {
 		return t
 	}
 	t.chain = e.agentFallback
-	// The primary's fallback policy belongs to the state, not to this turn:
-	// messages queued behind a fallback-only turn must still be eligible
-	// (blocked check, interception) when they are drained.
-	state.mu.Lock()
-	state.fallbackIntercept = interceptRetriable
-	state.turnInput = queuedMessageFromMessage(p, msg)
-	state.mu.Unlock()
 	if until, kind, blocked := t.chain.primaryBlocked(); blocked {
 		t.skipPrimary = true
 		t.blockedCause = turnOutcome{Intercepted: true, Kind: kind, ResetAt: until, blocked: true, Input: queuedMessageFromMessage(p, msg)}
@@ -303,46 +317,82 @@ func (t *primaryFallbackTurn) withWriteback(prompt string) string {
 	return primaryWritebackPrefix(t.guard.session) + prompt
 }
 
-// afterPrimaryTurn answers a turn the event loop handed back.
-func (t *primaryFallbackTurn) afterPrimaryTurn(out turnOutcome) {
-	if out.Intercepted {
-		t.e.answerWithFallbacks(t.guard, out)
-	}
-}
-
 // fallbackEvents is the chain's view of one processInteractiveEvents run.
 // A hook that returns true has ended the turn; the caller returns at once.
 // cp, sp and pendingSend point at the event loop's own variables, which it
-// replaces when it picks up a queued turn; outcome points at the run's named
-// result, so each run's hand-back belongs to that run's caller.
+// replaces when it picks up a queued turn. outcome belongs to this run only:
+// handBack, the run's first deferred call, answers it when the run returns.
 type fallbackEvents struct {
 	e               *Engine
 	state           *interactiveState
 	session         *Session
 	sessions        *SessionManager
 	sessionKey      string
+	lockGen         uint64
+	ccSessionKey    string
 	cp              **compactProgressWriter
 	sp              **streamPreview
 	pendingSend     *<-chan error
-	outcome         *turnOutcome
+	outcome         turnOutcome
+	runOut          *turnOutcome
 	intercept       fallbackIntercept
 	isFallbackState bool
 }
 
-func (e *Engine) beginFallbackEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, cp **compactProgressWriter, sp **streamPreview, pendingSend *<-chan error, outcome *turnOutcome) *fallbackEvents {
+// fallbackRunOutcome is set by runFallbackTurn before it starts the event
+// loop: the run whose send channel is sendDone leaves its outcome in *out.
+type fallbackRunOutcome struct {
+	sendDone <-chan error
+	out      *turnOutcome
+}
+
+// beginFallbackEvents runs at the start of processInteractiveEvents, before
+// its other deferred calls, and takes what the caller set on the state for
+// this run.
+func (e *Engine) beginFallbackEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, lockGen uint64, sendDone <-chan error) *fallbackEvents {
+	f := &fallbackEvents{e: e, state: state, session: session, sessions: sessions, sessionKey: sessionKey, lockGen: lockGen}
 	state.mu.Lock()
-	intercept := state.fallbackIntercept
-	isFallbackState := state.isFallbackState
+	f.intercept = state.fallbackIntercept
+	f.isFallbackState = state.isFallbackState
+	f.ccSessionKey = state.turnCCKey
+	if sendDone != nil && state.fallbackRun.sendDone == sendDone {
+		f.runOut = state.fallbackRun.out
+		state.fallbackRun = fallbackRunOutcome{}
+	}
 	state.mu.Unlock()
-	return &fallbackEvents{
-		e: e, state: state, session: session, sessions: sessions, sessionKey: sessionKey,
-		cp: cp, sp: sp, pendingSend: pendingSend, outcome: outcome,
-		intercept: intercept, isFallbackState: isFallbackState,
+	return f
+}
+
+// bindTurn gives the hooks the event loop's writer and send variables.
+func (f *fallbackEvents) bindTurn(cp **compactProgressWriter, sp **streamPreview, pendingSend *<-chan error) {
+	f.cp, f.sp, f.pendingSend = cp, sp, pendingSend
+}
+
+// handBack runs when the event loop returns, after the loop's own deferred
+// calls (typing stop, done reaction). A fallback agent's run leaves its
+// outcome to runFallbackTurn. A primary turn, or a queued turn of the drain,
+// that the loop handed back is answered by the fallback chain, with the
+// guard of this run: its own state, session and lock generation.
+func (f *fallbackEvents) handBack() {
+	if f.isFallbackState {
+		if f.runOut == nil {
+			slog.Error("agent fallback: fallback run has no outcome slot; its outcome is lost",
+				"session_key", f.sessionKey, "intercepted", f.outcome.Intercepted)
+			return
+		}
+		*f.runOut = f.outcome
+		return
+	}
+	if f.outcome.Intercepted {
+		f.e.answerWithFallbacks(fallbackGuard{
+			primary: f.state, session: f.session, sessions: f.sessions, lockGen: f.lockGen,
+			interactiveKey: f.sessionKey, ccSessionKey: f.ccSessionKey,
+		}, f.outcome)
 	}
 }
 
 // interceptTurn ends the turn without showing the failure and hands it to
-// the caller (the run's returned turnOutcome).
+// handBack.
 func (f *fallbackEvents) interceptTurn(kind ErrorKind, resetAt time.Time, errText string) {
 	e := f.e
 	// First, before any platform call or wait below can block: from here
@@ -366,7 +416,7 @@ func (f *fallbackEvents) interceptTurn(kind ErrorKind, resetAt time.Time, errTex
 	f.state.mu.Unlock()
 	slog.Warn("agent turn failed; handing it to the fallback chain",
 		"session_key", f.sessionKey, "kind", kind, "reset_at", resetAt, "error", errText)
-	*f.outcome = turnOutcome{Intercepted: true, Kind: kind, ResetAt: resetAt, ErrText: errText, Input: in, handoffBegun: handoff}
+	f.outcome = turnOutcome{Intercepted: true, Kind: kind, ResetAt: resetAt, ErrText: errText, Input: in, handoffBegun: handoff}
 }
 
 // sendFailed handles the result of the turn's Send: a guarded send that found
@@ -528,6 +578,7 @@ type fallbackDrainTurn struct {
 // popped.
 func (e *Engine) beginFallbackDrainTurnLocked(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, lockGen uint64, queued queuedMessage) *fallbackDrainTurn {
 	state.turnInput = queued
+	state.turnCCKey = ""
 	return &fallbackDrainTurn{
 		e: e, state: state, session: session, sessions: sessions, sessionKey: sessionKey, lockGen: lockGen, queued: queued,
 		active: state.fallbackIntercept == interceptRetriable && e.agentFallback != nil,
@@ -599,6 +650,7 @@ func (d *fallbackDrainTurn) ensurePrimary(state **interactiveState, as *AgentSes
 	restarted.currentTurnUserMessageTimeMs = queued.userMessageTimeMs
 	restarted.fallbackIntercept = interceptRetriable
 	restarted.turnInput = queued
+	restarted.turnCCKey = ""
 	*as = restarted.agentSession
 	restarted.mu.Unlock()
 	*state = restarted
@@ -641,13 +693,10 @@ func (d *fallbackDrainTurn) beforeSend(prompt string, as AgentSession) (string, 
 	return primaryWritebackPrefix(d.session) + prompt, guarded
 }
 
-// afterTurn answers a queued turn the event loop handed back (out) and, for
-// a fallback-eligible drain, hands the event channel back to the unsolicited
-// reader.
-func (d *fallbackDrainTurn) afterTurn(out turnOutcome) {
-	if out.Intercepted {
-		d.e.answerWithFallbacks(d.guard(), out)
-	}
+// afterTurn runs after a queued turn (the event loop has already answered a
+// turn it handed back): for a fallback-eligible drain, it hands the event
+// channel back to the unsolicited reader.
+func (d *fallbackDrainTurn) afterTurn() {
 	if d.active {
 		d.e.restartUnsolicitedReaderAfterQueuedTurn(d.state, d.session, d.sessions, d.sessionKey)
 	}
