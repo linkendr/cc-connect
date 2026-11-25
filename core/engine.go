@@ -4467,12 +4467,11 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 		sendDone <- err
 	}()
 
-	outcome := e.processInteractiveEvents(state, session, sessions, interactiveKey, msg.MessageID, turnStart, stopTyping, sendDone, msg.ReplyCtx, lockGen)
+	e.processInteractiveEvents(state, session, sessions, interactiveKey, msg.MessageID, turnStart, stopTyping, sendDone, msg.ReplyCtx, lockGen)
 	if elapsed := time.Since(sendStart); elapsed >= slowAgentSend {
 		slog.Warn("slow agent send", "elapsed", elapsed, "session", msg.SessionKey, "content_len", len(msg.Content))
 	}
 	stopTyping = nil // ownership transferred; prevent defer from double-stopping
-	fb.afterPrimaryTurn(outcome)
 	// An agent can die while later messages are queued. Its cleanup leaves a
 	// placeholder with those messages; restart under this same session lock.
 	e.interactiveMu.Lock()
@@ -5887,7 +5886,7 @@ func (e *Engine) agentErrorReply(err error) (string, string) {
 	return fmt.Sprintf(e.i18n.T(MsgError), e.agentErrorText(err)), "agent_error"
 }
 
-func (e *Engine) processInteractiveEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, msgID string, turnStart time.Time, stopTypingFn func(), sendDone <-chan error, replyCtx any, lockGen uint64) (outcome turnOutcome) {
+func (e *Engine) processInteractiveEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, msgID string, turnStart time.Time, stopTypingFn func(), sendDone <-chan error, replyCtx any, lockGen uint64) {
 	state.mu.Lock()
 	deliveryLabel := state.deliveryLabel
 	state.mu.Unlock()
@@ -5919,6 +5918,8 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	// doneReaction stores a function to add a "done" emoji after stopTyping.
 	// Set during EventResult handling for multi-round quiet turns.
 	var doneReaction func()
+	fbt := e.beginFallbackEvents(state, session, sessions, sessionKey, lockGen, sendDone)
+	defer fbt.handBack()
 	defer func() {
 		if stopTyping != nil {
 			stopTyping()
@@ -5993,7 +5994,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 	events := state.agentSession.Events()
 	stopCh := state.stopSignal()
-	fbt := e.beginFallbackEvents(state, session, sessions, sessionKey, &cp, &sp, &pendingSend, &outcome)
+	fbt.bindTurn(&cp, &sp, &pendingSend)
 	for {
 		var event Event
 		var ok bool
@@ -7489,7 +7490,6 @@ channelClosed:
 			}
 		}
 	}
-	return
 }
 
 func mergeRichToolResult(steps []ToolStep, event Event, result string, maxLen int) []ToolStep {
@@ -7670,7 +7670,8 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		state.mu.Lock()
 		state.deliveryLabel = ""
 		state.mu.Unlock()
-		fd.afterTurn(e.processInteractiveEvents(state, session, sessions, sessionKey, queued.messageID, time.Now(), stopTyping, sendDone, queued.replyCtx, lockGen))
+		e.processInteractiveEvents(state, session, sessions, sessionKey, queued.messageID, time.Now(), stopTyping, sendDone, queued.replyCtx, lockGen)
+		fd.afterTurn()
 	}
 }
 
