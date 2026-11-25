@@ -218,6 +218,7 @@ type primaryFallbackTurn struct {
 	e            *Engine
 	chain        *agentFallbackChain
 	guard        fallbackGuard
+	agent        Agent
 	workspaceDir string
 	// skipPrimary: the primary reported a limit reset time that has not
 	// passed; answer with the chain without sending to the primary.
@@ -229,6 +230,7 @@ func (e *Engine) beginPrimaryFallbackTurn(p Platform, msg *Message, agent Agent,
 	t := &primaryFallbackTurn{
 		e:            e,
 		guard:        fallbackGuard{primary: state, session: session, sessions: sessions, lockGen: lockGen, interactiveKey: interactiveKey, ccSessionKey: ccSessionKey},
+		agent:        agent,
 		workspaceDir: workspaceDir,
 	}
 	if e.agentFallback == nil || agent != e.agent {
@@ -251,10 +253,10 @@ func (e *Engine) beginPrimaryFallbackTurn(p Platform, msg *Message, agent Agent,
 
 // answerWithoutPrimary runs a skipPrimary turn to its end, in place of the
 // rest of processInteractiveMessageWith after the unsolicited reader was
-// stopped. It mirrors upstream's tail of that function (start the
-// unsolicited reader, arm the idle close, drain queued messages) and
-// returns drainPendingMessages' result (true = the session lock was
-// released).
+// stopped. It mirrors upstream's tail of that function (restart a queue
+// left by a dead agent, arm the idle close or schedule reader recovery,
+// drain queued messages and start the unsolicited reader once the queue is
+// empty) and returns true when the session lock was released.
 func (t *primaryFallbackTurn) answerWithoutPrimary(needResync bool, stopTyping *func()) bool {
 	e, state, g := t.e, t.guard.primary, t.guard
 	if needResync && state.agentSession != nil {
@@ -267,14 +269,30 @@ func (t *primaryFallbackTurn) answerWithoutPrimary(needResync bool, stopTyping *
 	}
 	e.answerWithFallbacks(g, t.blockedCause)
 
+	e.interactiveMu.Lock()
+	replacement := e.interactiveStates[g.interactiveKey]
+	e.interactiveMu.Unlock()
+	if replacement != nil && replacement != state {
+		replacement.mu.Lock()
+		queued := len(replacement.pendingMessages) > 0
+		replacement.mu.Unlock()
+		if queued {
+			e.drainOrphanedQueue(g.session, g.sessions, g.interactiveKey, t.agent, t.workspaceDir, g.lockGen)
+			return true
+		}
+	}
+
 	state.mu.Lock()
 	alive := state.agentSession != nil && state.agentSession.Alive() && !state.stopped && !state.eventsNeedResync
 	state.mu.Unlock()
 	if alive {
-		e.startUnsolicitedReader(state, g.session, g.sessions, g.interactiveKey, t.workspaceDir)
 		e.scheduleAgentSessionIdleClose(g.interactiveKey, state)
+	} else {
+		e.scheduleUnsolicitedReaderRecovery(state, g.session, g.sessions, g.interactiveKey, t.workspaceDir)
 	}
-	return e.drainPendingMessages(state, g.session, g.sessions, g.interactiveKey, g.lockGen)
+	return e.drainPendingMessages(state, g.session, g.sessions, g.interactiveKey, g.lockGen, func() {
+		e.startIdleUnsolicitedReader(state, g.session, g.sessions, g.interactiveKey, t.workspaceDir)
+	})
 }
 
 // withWriteback prepends the fallback turns the primary has not seen.

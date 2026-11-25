@@ -3,6 +3,7 @@ package opencode
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -157,6 +158,7 @@ func TestOpencodeSessionSendRunsInWorkDir(t *testing.T) {
 			os.Exit(2)
 		}
 		_, _ = os.Stdout.WriteString(`{"type":"text","part":{"text":"cwd recorded"}}` + "\n")
+		_, _ = os.Stdout.WriteString(`{"type":"step_finish","part":{"reason":"stop"}}` + "\n")
 		os.Exit(0)
 	}
 
@@ -308,6 +310,7 @@ func TestHandleStepStopSendsEventResult(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	s := &opencodeSession{events: make(chan core.Event, 1), ctx: ctx}
+	s.textSent.Store(true)
 	s.handleStepFinish(raw)
 
 	select {
@@ -364,6 +367,7 @@ func TestHandleStepDuplicateEventResultPrevented(t *testing.T) {
 		ctx:        ctx,
 		resultSent: atomic.Bool{},
 	}
+	s.textSent.Store(true)
 
 	s.handleStepFinish(raw)
 	s.handleStepFinish(raw)
@@ -584,19 +588,33 @@ func TestOpencodeSilentCrashIsError(t *testing.T) {
 	if evt.ErrorKind != core.ErrorKindUnknown {
 		t.Errorf("ErrorKind = %q, want unclassified (provider-side)", evt.ErrorKind)
 	}
-}
-
-// A clean exit with no output keeps the existing synthesized result.
-func TestOpencodeCleanEmptyExitIsResult(t *testing.T) {
-	if evt := firstOpencodeEvent(t, "exit 0"); evt.Type != core.EventResult {
-		t.Fatalf("event = %v, want EventResult", evt.Type)
+	if !errors.Is(evt.Error, core.ErrAgentExitedWithoutOutput) {
+		t.Errorf("error = %v, want it to wrap ErrAgentExitedWithoutOutput (translated for users)", evt.Error)
 	}
 }
 
-func TestOpencodeStdoutTextWithFailureKeepsResult(t *testing.T) {
-	// Non-JSON stdout + exit 1 + empty stderr: unchanged from main (the
-	// synthesized empty result), not an error.
-	if evt := firstOpencodeEvent(t, "echo diagnostic\nexit 1"); evt.Type != core.EventResult {
-		t.Fatalf("event = %v, want EventResult", evt.Type)
+// A clean exit with no output is an error (upstream 15652618), shown to
+// users as the translated silent-exit message.
+func TestOpencodeCleanEmptyExitIsSilentExitError(t *testing.T) {
+	evt := firstOpencodeEvent(t, "exit 0")
+	if evt.Type != core.EventError || !errors.Is(evt.Error, core.ErrAgentExitedWithoutOutput) {
+		t.Fatalf("event = %v (%v), want EventError wrapping ErrAgentExitedWithoutOutput", evt.Type, evt.Error)
+	}
+}
+
+// Non-JSON stdout is not answer text: a failed exit after it is a silent
+// exit error (upstream 02b1217e reports every non-zero exit).
+func TestOpencodeStdoutDiagnosticWithFailureIsError(t *testing.T) {
+	evt := firstOpencodeEvent(t, "echo diagnostic\nexit 1")
+	if evt.Type != core.EventError || !errors.Is(evt.Error, core.ErrAgentExitedWithoutOutput) {
+		t.Fatalf("event = %v (%v), want EventError wrapping ErrAgentExitedWithoutOutput", evt.Type, evt.Error)
+	}
+}
+
+// A failed exit keeps the stderr error kind for the fallback chain.
+func TestOpencodeFailedExitClassifiesStderr(t *testing.T) {
+	evt := firstOpencodeEvent(t, "echo 'ContextOverflowError: input exceeds the context window' >&2\nexit 1")
+	if evt.Type != core.EventError || evt.ErrorKind != core.ErrorKindContextTooLong {
+		t.Fatalf("event = %v kind=%q (%v), want EventError with ErrorKindContextTooLong", evt.Type, evt.ErrorKind, evt.Error)
 	}
 }
