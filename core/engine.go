@@ -1255,6 +1255,10 @@ func resolveDisabledCmds(cmds []string) map[string]bool {
 	m := make(map[string]bool, len(cmds))
 	for _, c := range cmds {
 		c = strings.ToLower(strings.TrimPrefix(c, "/"))
+		if c == "delete-mode" {
+			// The delete-mode card performs /delete; see cardActionCommandID.
+			c = "delete"
+		}
 		if c == "*" {
 			for _, bc := range builtinCommands {
 				m[bc.id] = true
@@ -2632,7 +2636,9 @@ func (e *Engine) initPlatformCapabilities(p Platform) {
 		}
 	}
 
-	if nav, ok := p.(CardNavigable); ok {
+	if nav, ok := p.(UserAwareCardNavigable); ok {
+		nav.SetUserAwareCardNavigationHandler(e.handleCardNavForUser)
+	} else if nav, ok := p.(CardNavigable); ok {
 		nav.SetCardNavigationHandler(e.handleCardNav)
 	}
 	if la, ok := p.(LocalizerAware); ok {
@@ -5573,18 +5579,20 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 		if strings.TrimSpace(partial) == "" {
 			return
 		}
+		// Same NO_REPLY semantics as a completed background turn.
+		outbound, _ := resolveUnsolicitedReply(partial)
 		state.mu.Lock()
 		p := state.platform
 		replyCtx := state.replyCtx
 		state.mu.Unlock()
-		if p != nil {
+		if p != nil && outbound != "" {
 			// Send off the reader goroutine and signal flushDone when finished.
 			// stopUnsolicitedReader waits for flushDone within its bounded
 			// timeout, which keeps the flushed text ahead of the next
 			// foreground turn's reply in the common case while a slow
 			// platform call can never extend that wait (some callers hold
 			// interactiveMu) beyond the bound.
-			chunks := SplitMessageCodeFenceAware(partial, maxPlatformMessageLen)
+			chunks := SplitMessageCodeFenceAware(outbound, maxPlatformMessageLen)
 			flushHandedOff = true
 			go func() {
 				defer close(flushDone)
@@ -5694,8 +5702,11 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 					fullResponse = strings.Join(textParts, "")
 				}
 
-				if fullResponse != "" {
-					for _, chunk := range SplitMessageCodeFenceAware(fullResponse, maxPlatformMessageLen) {
+				// Background turns must honor NO_REPLY too: a bare marker
+				// means nothing is delivered, a trailing marker is stripped.
+				outbound, silent := resolveUnsolicitedReply(fullResponse)
+				if outbound != "" {
+					for _, chunk := range SplitMessageCodeFenceAware(outbound, maxPlatformMessageLen) {
 						e.send(p, replyCtx, chunk)
 					}
 				}
@@ -5744,7 +5755,8 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 
 				slog.Info("unsolicited turn complete",
 					"session", sessionKey,
-					"response_len", len(fullResponse))
+					"response_len", len(fullResponse),
+					"silent", silent)
 
 			case EventUserInputRequest:
 				e.showAsyncUserInput(state, p, replyCtx, event)
@@ -6044,7 +6056,8 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			state.eventsNeedResync = true
 			p := state.platform
 			state.mu.Unlock()
-			e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "agent session timed out (no response)"))
+			e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgAgentIdleTimeout), e.eventIdleTimeout))
+			e.notifyDroppedQueuedMessagesWithText(state, e.i18n.T(MsgQueuedMessageTimedOut))
 			e.cleanupInteractiveState(sessionKey, state)
 			return
 		case <-turnDeadlineCh:
@@ -7543,12 +7556,16 @@ func mergeRichToolResult(steps []ToolStep, event Event, result string, maxLen in
 // the event loop exits abnormally (EventError, channel closed) and queued
 // messages can no longer be delivered to the agent.
 func (e *Engine) notifyDroppedQueuedMessages(state *interactiveState, reason error) {
+	e.notifyDroppedQueuedMessagesWithText(state, fmt.Sprintf(e.i18n.T(MsgError), e.agentErrorText(reason)))
+}
+
+func (e *Engine) notifyDroppedQueuedMessagesWithText(state *interactiveState, text string) {
 	state.mu.Lock()
 	remaining := state.pendingMessages
 	state.pendingMessages = nil
 	state.mu.Unlock()
 	for _, q := range remaining {
-		e.send(q.platform, q.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), e.agentErrorText(reason)))
+		e.send(q.platform, q.replyCtx, text)
 	}
 }
 
@@ -7843,6 +7860,56 @@ func splitCommandArgs(s string) []string {
 	return tokens
 }
 
+// disabledCmdsFor resolves the disabled commands for userID: role-based if
+// available, else project-level.
+func (e *Engine) disabledCmdsFor(userID string) map[string]bool {
+	e.userRolesMu.RLock()
+	disabledCmds := e.disabledCmds
+	urm := e.userRoles
+	e.userRolesMu.RUnlock()
+	if urm != nil {
+		if role := urm.ResolveRole(userID); role != nil {
+			disabledCmds = role.DisabledCmds
+		}
+	}
+	return disabledCmds
+}
+
+// cardActionCommandID maps the command of a card action ("/provider/add",
+// "/delete-mode") to the built-in command it belongs to, or "" if none.
+func cardActionCommandID(cmd string) string {
+	name := strings.ToLower(strings.TrimPrefix(cmd, "/"))
+	if i := strings.IndexByte(name, '/'); i >= 0 {
+		name = name[:i]
+	}
+	if name == "delete-mode" {
+		return "delete"
+	}
+	for _, c := range builtinCommands {
+		for _, n := range c.names {
+			if n == name {
+				return c.id
+			}
+		}
+	}
+	return ""
+}
+
+// cardActionNeedsActor reports whether a card action needs the clicker's
+// identity when user roles are configured. Only read-only views that show
+// nothing beyond the card's own session may render for legacy adapters that
+// cannot identify the clicker; everything else fails closed there.
+func cardActionNeedsActor(prefix, cmdID string) bool {
+	if prefix != "nav" {
+		return true
+	}
+	switch cmdID {
+	case "help", "status", "list", "current", "whoami", "version":
+		return false
+	}
+	return true
+}
+
 func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 	parts := splitCommandArgs(raw)
 	cmd := strings.ToLower(strings.TrimPrefix(parts[0], "/"))
@@ -7850,16 +7917,7 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 
 	cmdID := matchPrefix(cmd, builtinCommands)
 
-	// Resolve effective disabled commands: role-based if available, else project-level
-	e.userRolesMu.RLock()
-	disabledCmds := e.disabledCmds
-	urm := e.userRoles
-	e.userRolesMu.RUnlock()
-	if urm != nil {
-		if role := urm.ResolveRole(msg.UserID); role != nil {
-			disabledCmds = role.DisabledCmds
-		}
-	}
+	disabledCmds := e.disabledCmdsFor(msg.UserID)
 
 	if cmdID != "" && disabledCmds[cmdID] {
 		slog.Info("audit: command_blocked",
@@ -9192,6 +9250,14 @@ func sendChunksWithStatusFooter(ctx context.Context, p Platform, replyCtx any, b
 			if sfs, ok := p.(StatusFooterSender); ok {
 				if err := sfs.SendWithStatusFooter(ctx, replyCtx, chunk, statusFooter); err == nil {
 					continue
+				} else if errors.Is(err, ErrMaybeDelivered) {
+					// The footer send reported a failure but the message may
+					// already have reached the chat (e.g. Feishu code=2200).
+					// Re-sending the same chunk inline would duplicate it, so
+					// report the failure and let the caller bail.
+					slog.Error("platform send failed (may have been delivered)",
+						"platform", p.Name(), "error", err, "content_len", len(chunk))
+					return false
 				} else {
 					slog.Warn("SendWithStatusFooter failed, falling back to inline footer", "error", err)
 				}
@@ -10789,7 +10855,7 @@ func (e *Engine) cmdHelp(p Platform, msg *Message) {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgHelp))
 		return
 	}
-	e.replyWithCard(p, msg.ReplyCtx, e.renderHelpCard())
+	e.replyWithCard(p, msg.ReplyCtx, e.renderHelpGroupCardFor(defaultHelpGroup, e.disabledCmdsFor(msg.UserID)))
 }
 
 // cmdStart handles the `/start` slash command.
@@ -10893,10 +10959,6 @@ func helpCardGroups() []helpCardGroup {
 	}
 }
 
-func (e *Engine) renderHelpCard() *Card {
-	return e.renderHelpGroupCard(defaultHelpGroup)
-}
-
 // splitHelpTabRows splits tab buttons into rows. Card-based platforms
 // get 2 buttons per row for better layout; others get all in one row.
 func splitHelpTabRows(useMultiRow bool, tabs []CardButton) [][]CardButton {
@@ -10914,7 +10976,9 @@ func splitHelpTabRows(useMultiRow bool, tabs []CardButton) [][]CardButton {
 	return [][]CardButton{tabs}
 }
 
-func (e *Engine) renderHelpGroupCard(groupKey string) *Card {
+// renderHelpGroupCardFor renders the help card without the commands in
+// disabled, so it offers no button that would only be refused.
+func (e *Engine) renderHelpGroupCardFor(groupKey string, disabled map[string]bool) *Card {
 	sectionTitle := func(key MsgKey) string {
 		section := e.i18n.T(key)
 		if idx := strings.IndexByte(section, '\n'); idx >= 0 {
@@ -10952,6 +11016,9 @@ func (e *Engine) renderHelpGroupCard(groupKey string) *Card {
 		cb.ButtonsEqual(row...)
 	}
 	for _, item := range current.items {
+		if disabled[cardActionCommandID(item.command)] {
+			continue
+		}
 		cb.ListItem(commandText(item.command), "▶", item.action)
 	}
 	cb.Note(e.i18n.T(MsgHelpTip))
@@ -13653,6 +13720,13 @@ func (e *Engine) sendWithCard(p Platform, replyCtx any, card *Card) {
 // handleCardNav is called by platforms that support in-place card updates.
 // It routes nav: and act: prefixed actions to the appropriate render function.
 func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
+	// Legacy adapters cannot identify the clicker. Never treat the card's
+	// embedded session owner as the actor; identity-dependent actions fail
+	// closed below until the adapter implements UserAwareCardNavigable.
+	return e.handleCardNavForUser(action, sessionKey, "")
+}
+
+func (e *Engine) handleCardNavForUser(action, sessionKey, userID string) *Card {
 	var prefix, body string
 	if i := strings.Index(action, ":"); i >= 0 {
 		prefix = action[:i]
@@ -13667,6 +13741,46 @@ func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
 		args = strings.TrimSpace(body[i+1:])
 	}
 
+	// Card buttons reach commands without going through handleCommand, so a
+	// disabled command must be refused here too: the /help card links to
+	// /provider, /dir and /upgrade whatever disabled_commands says.
+	if cmdID := cardActionCommandID(cmd); cmdID != "" {
+		if e.disabledCmdsFor(userID)[cmdID] {
+			slog.Info("audit: command_blocked",
+				"user_id", userID, "project", e.name,
+				"command", cmdID, "reason", "disabled", "via", "card")
+			return e.simpleCard("/"+cmdID, "red", fmt.Sprintf(e.i18n.T(MsgCommandDisabled), "/"+cmdID))
+		}
+		privileged := isPrivilegedCommandInvocation(cmdID, splitCommandArgs(args))
+		if userID == "" {
+			e.userRolesMu.RLock()
+			hasRoles := e.userRoles != nil
+			e.userRolesMu.RUnlock()
+			if privileged || (hasRoles && cardActionNeedsActor(prefix, cmdID)) {
+				slog.Info("audit: command_blocked",
+					"project", e.name, "command", cmdID,
+					"reason", "missing_actor", "via", "card")
+				return e.simpleCard("/"+cmdID, "red", e.i18n.T(MsgCardActorRequired))
+			}
+		}
+		// Apply the same privilege gate as text commands before any rendering
+		// or mutation. The card's session owner is not the acting user.
+		if privileged && !e.isAdmin(userID) {
+			slog.Info("audit: command_blocked",
+				"user_id", userID, "project", e.name,
+				"command", cmdID, "reason", "unauthorized", "via", "card")
+			return e.simpleCard("/"+cmdID, "red", fmt.Sprintf(e.i18n.T(MsgAdminRequired), "/"+cmdID))
+		}
+	}
+
+	// Legacy adapters pass no clicker. The read-only /status and /whoami views
+	// keep showing the user the session key names, as before; it is used for
+	// display only, never for the checks above.
+	displayUserID := userID
+	if displayUserID == "" {
+		displayUserID = extractUserID(sessionKey)
+	}
+
 	if prefix == "act" && cmd == "/model" {
 		return e.handleModelCardAction(args, sessionKey)
 	}
@@ -13677,7 +13791,7 @@ func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
 
 	switch cmd {
 	case "/help":
-		return e.renderHelpGroupCard(args)
+		return e.renderHelpGroupCardFor(args, e.disabledCmdsFor(userID))
 	case "/model":
 		return e.renderModelCard(sessionKey)
 	case "/reasoning":
@@ -13688,7 +13802,7 @@ func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
 	case "/lang":
 		return e.renderLangCard()
 	case "/status":
-		return e.renderStatusCard(sessionKey, extractUserID(sessionKey))
+		return e.renderStatusCard(sessionKey, displayUserID)
 	case "/list":
 		page := 1
 		if args != "" {
@@ -13714,9 +13828,9 @@ func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
 	case "/provider/add", "/provider/add-other", "/provider/add-cancel":
 		return e.renderProviderAddCard(sessionKey)
 	case "/cron":
-		return e.renderCronCard(sessionKey, extractUserID(sessionKey))
+		return e.renderCronCard(sessionKey, userID)
 	case "/timer":
-		return e.renderTimerCard(sessionKey, extractUserID(sessionKey))
+		return e.renderTimerCard(sessionKey, userID)
 	case "/heartbeat":
 		return e.renderHeartbeatCard()
 	case "/commands":
@@ -13732,7 +13846,7 @@ func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
 	case "/whoami":
 		return e.renderWhoamiCard(&Message{
 			SessionKey: sessionKey,
-			UserID:     extractUserID(sessionKey),
+			UserID:     displayUserID,
 			Platform:   extractPlatformName(sessionKey),
 		})
 	case "/version":
@@ -13747,7 +13861,7 @@ func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
 		}
 		return e.renderDeleteModeCard(sessionKey)
 	case "/stop":
-		return e.renderStatusCard(sessionKey, extractUserID(sessionKey))
+		return e.renderStatusCard(sessionKey, displayUserID)
 	case "/upgrade":
 		return e.renderUpgradeCard()
 	}
@@ -17504,6 +17618,10 @@ func (e *Engine) relayContextForSourceSessionKey(fromProject, sourceSessionKey s
 // dedicated relay session, sends the message to the agent, and blocks until
 // the complete response is collected (or the relay context times out).
 func (e *Engine) HandleRelay(ctx context.Context, fromProject, sourceSessionKey, message string) (string, error) {
+	return e.handleRelay(ctx, fromProject, sourceSessionKey, message, nil)
+}
+
+func (e *Engine) handleRelay(ctx context.Context, fromProject, sourceSessionKey, message string, onVisibleResponse func(string)) (response string, err error) {
 	agent, sessions, relaySessionKey, err := e.relayContextForSourceSessionKey(fromProject, sourceSessionKey)
 	if err != nil {
 		return "", err
@@ -17572,6 +17690,16 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, sourceSessionKey,
 	}
 
 	var textParts []string
+	var visibleResponse string
+	defer func() {
+		if onVisibleResponse != nil {
+			if visibleResponse == "" && len(textParts) > 0 {
+				// Preserve the caller's timeout notice around partial assistant text.
+				visibleResponse = response
+			}
+			onVisibleResponse(visibleResponse)
+		}
+	}()
 	for event := range agentSession.Events() {
 		switch event.Type {
 		case EventText:
@@ -17595,6 +17723,7 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, sourceSessionKey,
 				saveRelaySessionID(currentID, true)
 			}
 			resp := event.Content
+			visibleResponse = event.Content
 			if resp == "" && len(textParts) > 0 {
 				resp = strings.Join(textParts, "")
 			}
@@ -18720,6 +18849,17 @@ func stripTrailingSilent(text string) (string, bool) {
 		return text, false
 	}
 	return strings.TrimRight(stripped, " \t\r\n"), true
+}
+
+// resolveUnsolicitedReply applies NO_REPLY semantics to a background (unsolicited)
+// turn's final text: a bare marker means "deliver nothing" (silent=true); a
+// trailing marker is stripped from otherwise normal content.
+func resolveUnsolicitedReply(text string) (string, bool) {
+	if isSilentReply(text) {
+		return "", true
+	}
+	stripped, ok := stripTrailingSilent(text)
+	return stripped, ok && strings.TrimSpace(stripped) == ""
 }
 
 // couldBeSilentPrefix reports whether the trimmed text is still a case-insensitive

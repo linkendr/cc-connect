@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/chenhg5/cc-connect/core"
+	"github.com/google/uuid"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
@@ -162,16 +163,17 @@ type Platform struct {
 	threadIsolation            bool
 	groupChatHistoryShare      bool
 	// noReplyToTrigger: when true, send via Create instead of Im.Message.Reply (no quote to the user's message).
-	noReplyToTrigger bool
-	resolveMentions  bool
-	client           *lark.Client
-	replayClient     *lark.Client
-	replayClientMu   sync.Mutex
-	handler          core.MessageHandler
-	cardNavHandler   core.CardNavigationHandler
-	cancel           context.CancelFunc
-	dedup            *core.MessageDedup
-	botOpenID        string
+	noReplyToTrigger        bool
+	resolveMentions         bool
+	client                  *lark.Client
+	replayClient            *lark.Client
+	replayClientMu          sync.Mutex
+	handler                 core.MessageHandler
+	cardNavHandler          core.CardNavigationHandler
+	userAwareCardNavHandler core.UserAwareCardNavigationHandler
+	cancel                  context.CancelFunc
+	dedup                   *core.MessageDedup
+	botOpenID               string
 	// groupFilterDegraded is true when bot open_id discovery failed at startup
 	// (e.g. transient network/DNS/proxy outage). When true, group chat mention
 	// filtering fails closed (silently drops group messages without @bot) instead
@@ -367,7 +369,17 @@ type richCardImageUpload struct {
 type feishuRequestFunc func(client *lark.Client, options ...larkcore.RequestOptionFunc) error
 
 func (p *Platform) SetCardNavigationHandler(h core.CardNavigationHandler) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.cardNavHandler = h
+	p.userAwareCardNavHandler = nil
+}
+
+func (p *Platform) SetUserAwareCardNavigationHandler(h core.UserAwareCardNavigationHandler) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.userAwareCardNavHandler = h
+	p.cardNavHandler = nil
 }
 
 func New(opts map[string]any) (core.Platform, error) {
@@ -1107,10 +1119,16 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 				},
 			}, nil
 		}
-		if p.cardNavHandler != nil {
+		p.mu.RLock()
+		nav, userAwareNav := p.cardNavHandler, p.userAwareCardNavHandler
+		p.mu.RUnlock()
+		if h := userAwareNav; h != nil {
+			nav = func(action, key string) *core.Card { return h(action, key, userID) }
+		}
+		if nav != nil {
 			done := make(chan *core.Card, 1)
 			go func() {
-				done <- p.cardNavHandler(actionVal, sessionKey)
+				done <- nav(actionVal, sessionKey)
 			}()
 
 			select {
@@ -1813,7 +1831,7 @@ func (p *Platform) groupHistoryScope(msg *larkim.EventMessage, chatID string) st
 		return ""
 	}
 	if p.threadIsolation && msg != nil && stringValue(msg.ChatType) == "group" {
-		if rootID := stringValue(msg.RootId); rootID != "" {
+		if rootID := threadRootID(msg); rootID != "" {
 			return "thread:" + chatID + ":" + rootID
 		}
 	}
@@ -2792,17 +2810,33 @@ func (p *Platform) fetchChatMembers(ctx context.Context, chatID string) (map[str
 	if err != nil {
 		return nil, fmt.Errorf("%s: fetch tenant token for chat members: %w", p.tag(), err)
 	}
-	iter, err := p.client.Im.ChatMembers.GetByIterator(timeoutCtx, req, larkcore.WithTenantAccessToken(token))
-	if err != nil {
-		return nil, fmt.Errorf("%s: list chat members: %w", p.tag(), err)
-	}
-	for {
-		hasMore, member, err := iter.Next()
+	// Page manually instead of using GetByIterator: the SDK iterator ignores
+	// has_more and keeps refetching page 1 when Feishu returns an empty (not
+	// absent) page_token on the last page, which loops until the timeout.
+	pageToken := ""
+	for page := 0; page < 50; page++ {
+		if pageToken != "" {
+			req = larkim.NewGetChatMembersReqBuilder().
+				ChatId(chatID).
+				MemberIdType("open_id").
+				PageSize(100).
+				PageToken(pageToken).
+				Build()
+		}
+		resp, err := p.client.Im.ChatMembers.Get(timeoutCtx, req, larkcore.WithTenantAccessToken(token))
 		if err != nil {
-			slog.Debug(p.tag()+": fetch chat members page error", "chat_id", chatID, "error", err)
+			return nil, fmt.Errorf("%s: list chat members: %w", p.tag(), err)
+		}
+		if !resp.Success() {
+			return nil, fmt.Errorf("%s: list chat members code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
+		}
+		if resp.Data == nil {
 			break
 		}
-		if member != nil && member.Name != nil && member.MemberId != nil {
+		for _, member := range resp.Data.Items {
+			if member == nil || member.Name == nil || member.MemberId == nil {
+				continue
+			}
 			name := *member.Name
 			if _, exists := members[name]; !exists {
 				members[name] = *member.MemberId
@@ -2810,9 +2844,10 @@ func (p *Platform) fetchChatMembers(ctx context.Context, chatID string) (map[str
 				members[name] = ""
 			}
 		}
-		if !hasMore {
+		if resp.Data.HasMore == nil || !*resp.Data.HasMore || resp.Data.PageToken == nil || *resp.Data.PageToken == "" {
 			break
 		}
+		pageToken = *resp.Data.PageToken
 	}
 	return members, nil
 }
@@ -4628,11 +4663,26 @@ func stripMentions(text string, mentions []*larkim.MentionEvent, botOpenID strin
 	return strings.TrimSpace(text)
 }
 
+// threadRootID is the root of the thread msg is in, or "" outside threads.
+// root_id names a thread only alongside thread_id: a plain reply in the main
+// channel carries the root of the chain it quotes, yet the bot answers it in
+// a new thread on the reply itself, and every later message there carries
+// the reply's id as root_id. Taking the quoted root would put the first turn
+// and the rest of that thread in two sessions.
+func threadRootID(msg *larkim.EventMessage) string {
+	if stringValue(msg.ThreadId) == "" {
+		return ""
+	}
+	return stringValue(msg.RootId)
+}
+
 // TODO: Session-key derivation and reply-thread behavior are split across multiple code paths here.
 // Should revisit thread/root handling without changing thread_isolation=false behavior.
 func (p *Platform) makeSessionKey(msg *larkim.EventMessage, chatID, userID string) string {
 	if p.threadIsolation && msg != nil && stringValue(msg.ChatType) == "group" {
-		rootID := stringValue(msg.RootId)
+		// A plain reply in the main channel is answered in a new thread
+		// on the reply itself (reply_in_thread): it roots its own session.
+		rootID := threadRootID(msg)
 		if rootID == "" {
 			rootID = stringValue(msg.MessageId)
 		}
@@ -4753,9 +4803,21 @@ func (p *Platform) sendNewMessageToChat(ctx context.Context, rc replyContext, ms
 }
 
 func (p *Platform) buildReplyMessageReqBody(rc replyContext, msgType, content string) *larkim.ReplyMessageReqBody {
+	return p.buildReplyMessageReqBodyWithUUID(rc, msgType, content, "")
+}
+
+// buildReplyMessageReqBodyWithUUID builds a reply body carrying a Feishu
+// idempotency key when idempotencyKey is non-empty. Feishu accepts the same
+// Uuid at most once per hour, so a transport-level retry after a response we
+// could not read does not post a second message when the first attempt already
+// reached the chat.
+func (p *Platform) buildReplyMessageReqBodyWithUUID(rc replyContext, msgType, content, idempotencyKey string) *larkim.ReplyMessageReqBody {
 	body := larkim.NewReplyMessageReqBodyBuilder().
 		MsgType(msgType).
 		Content(content)
+	if idempotencyKey != "" {
+		body.Uuid(idempotencyKey)
+	}
 	if p.shouldReplyInThread(rc) {
 		body.ReplyInThread(true)
 	}
@@ -4763,9 +4825,14 @@ func (p *Platform) buildReplyMessageReqBody(rc replyContext, msgType, content st
 }
 
 func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, content string) error {
+	// One idempotency key for every attempt of this send. Feishu dedupes on
+	// Uuid, so a transient retry (or a caller re-send that reuses the same
+	// logical send) does not post a duplicate when an earlier attempt already
+	// delivered despite returning code=2200 "internal error".
+	replyUUID := uuid.NewString()
 	req := larkim.NewReplyMessageReqBuilder().
 		MessageId(rc.messageID).
-		Body(p.buildReplyMessageReqBody(rc, msgType, content)).
+		Body(p.buildReplyMessageReqBodyWithUUID(rc, msgType, content, replyUUID)).
 		Build()
 	return p.withTransientRetry(ctx, "reply", func() error {
 		return p.withFreshTenantAccessTokenRetry(ctx, "reply", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
@@ -4774,6 +4841,12 @@ func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, c
 				return fmt.Errorf("%s: reply api call: %w", p.tag(), err)
 			}
 			if !resp.Success() {
+				// Code 2200 is Feishu's "internal error" and may be returned
+				// after the message was already delivered. Mark it so callers
+				// do not treat the reply as safely un-sent and re-post it.
+				if resp.Code == 2200 {
+					return fmt.Errorf("%s: reply failed code=%d msg=%s: %w", p.tag(), resp.Code, resp.Msg, core.ErrMaybeDelivered)
+				}
 				return fmt.Errorf("%s: reply failed code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
 			}
 			return nil

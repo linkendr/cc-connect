@@ -63,6 +63,14 @@ var ErrAgentCloseTimeout = errors.New("agent close timed out")
 // user the translated MsgAgentProcessStartFailed; the OS detail stays in logs.
 var ErrAgentProcessStart = errors.New("agent process could not be started")
 
+// ErrMaybeDelivered marks a send error where the platform reported a failure
+// but the message may in fact have reached the chat. A caller must NOT blindly
+// re-send on such an error, or it will post a second copy of the same reply.
+// Platforms wrap this sentinel (e.g. fmt.Errorf("...: %w", core.ErrMaybeDelivered))
+// for transient failures like Feishu's code=2200 "internal error" that are
+// returned after the message was actually delivered.
+var ErrMaybeDelivered = errors.New("message may have been delivered")
+
 // ReplyContextReconstructor is an optional interface for platforms that can
 // recreate a reply context from a session key. This is needed for cron jobs
 // to send messages to users without an incoming message.
@@ -331,8 +339,22 @@ type CardSender interface {
 
 // CardNavigationHandler is called by platforms to render a card for in-place
 // card updates (e.g. Feishu card.action.trigger callback). The action string
-// uses prefixes like "nav:/model" or "act:/model 3".
+// uses prefixes like "nav:/model" or "act:/model 3". This legacy API does not
+// carry authenticated identity: privileged commands, and with user roles
+// configured every action except read-only views such as nav:/help and
+// nav:/status, require UserAwareCardNavigable and are refused without it.
 type CardNavigationHandler func(action string, sessionKey string) *Card
+
+// UserAwareCardNavigationHandler receives the authenticated clicker separately
+// from the session key, which may be shared by several users.
+type UserAwareCardNavigationHandler func(action, sessionKey, userID string) *Card
+
+// UserAwareCardNavigable is preferred over CardNavigable when available, so
+// role policies follow the clicker rather than a user inferred from the session.
+// CardNavigable remains supported for adapters using the original callback API.
+type UserAwareCardNavigable interface {
+	SetUserAwareCardNavigationHandler(h UserAwareCardNavigationHandler)
+}
 
 // CardNavigable is an optional interface for platforms that support in-place
 // card navigation (updating the existing card instead of sending a new message).
